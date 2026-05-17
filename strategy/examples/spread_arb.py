@@ -16,6 +16,12 @@ class SpreadArbStrategy(BaseStrategy):
     Useful on liquid crypto pairs where spread typically stays tight.
     """
 
+    PARAMS_SCHEMA = {
+        "lookback": {"type": "int", "desc": "Spread history window size"},
+        "z_threshold": {"type": "float", "desc": "Z-score threshold to trigger entry"},
+        "order_size": {"type": "float", "desc": "Order size per trade"},
+    }
+
     def __init__(self, name: str, gateway: str, symbols: list[str],
                  lookback: int = 100, z_threshold: float = 2.0,
                  order_size: float = 0.01):

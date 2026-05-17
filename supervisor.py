@@ -29,6 +29,7 @@ PROCESS_REGISTRY = {
     "strategy_container": "strategy.runner",
     "risk_engine": "risk.runner",
     "view_telegram": "view.telegram_runner",
+    "view_web": "view.web.runner",
 }
 
 # Startup order matters: risk first, then gateways, then strategy, then view
@@ -38,6 +39,7 @@ STARTUP_ORDER = [
     "gateway_futu",
     "strategy_container",
     "view_telegram",
+    "view_web",
 ]
 
 

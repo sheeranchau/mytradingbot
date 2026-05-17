@@ -1,0 +1,440 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Trading Dashboard</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: 'SF Mono', 'Menlo', 'Monaco', monospace;
+            background: #0a0e17;
+            color: #e1e4e8;
+            font-size: 13px;
+        }
+
+        /* Header */
+        .header {
+            background: #161b22;
+            border-bottom: 1px solid #30363d;
+            padding: 12px 24px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+        .header h1 { font-size: 16px; color: #58a6ff; font-weight: 600; }
+        .ws-status {
+            padding: 4px 10px;
+            border-radius: 12px;
+            font-size: 11px;
+        }
+        .ws-connected { background: #1b4332; color: #2dd4bf; }
+        .ws-disconnected { background: #4a1a1a; color: #f87171; }
+
+        /* Layout */
+        .container { padding: 16px 24px; }
+        .grid { display: grid; gap: 16px; }
+        .grid-2 { grid-template-columns: 1fr 1fr; }
+        .grid-3 { grid-template-columns: 1fr 1fr 1fr; }
+
+        /* Cards */
+        .card {
+            background: #161b22;
+            border: 1px solid #30363d;
+            border-radius: 8px;
+            padding: 16px;
+        }
+        .card-title {
+            font-size: 12px;
+            color: #8b949e;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            margin-bottom: 12px;
+        }
+
+        /* Process status */
+        .process-row {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 6px 0;
+            border-bottom: 1px solid #21262d;
+        }
+        .process-row:last-child { border-bottom: none; }
+        .status-dot {
+            width: 8px; height: 8px;
+            border-radius: 50%;
+            display: inline-block;
+            margin-right: 8px;
+        }
+        .status-running { background: #2dd4bf; }
+        .status-stopped { background: #f87171; }
+
+        /* Strategy cards */
+        .strategy-card {
+            background: #161b22;
+            border: 1px solid #30363d;
+            border-radius: 8px;
+            padding: 16px;
+            margin-bottom: 16px;
+        }
+        .strategy-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 12px;
+        }
+        .strategy-name { font-size: 15px; font-weight: 600; color: #58a6ff; }
+        .strategy-meta { color: #8b949e; font-size: 12px; }
+
+        /* Toggle switch */
+        .toggle {
+            position: relative;
+            width: 40px; height: 20px;
+            cursor: pointer;
+        }
+        .toggle input { opacity: 0; width: 0; height: 0; }
+        .toggle .slider {
+            position: absolute; inset: 0;
+            background: #4a1a1a;
+            border-radius: 20px;
+            transition: 0.2s;
+        }
+        .toggle .slider:before {
+            content: "";
+            position: absolute;
+            width: 16px; height: 16px;
+            left: 2px; bottom: 2px;
+            background: #e1e4e8;
+            border-radius: 50%;
+            transition: 0.2s;
+        }
+        .toggle input:checked + .slider { background: #1b4332; }
+        .toggle input:checked + .slider:before { transform: translateX(20px); }
+
+        /* Stats grid */
+        .stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 12px; }
+        .stat-box { background: #0d1117; border-radius: 6px; padding: 10px; }
+        .stat-label { font-size: 11px; color: #8b949e; margin-bottom: 4px; }
+        .stat-value { font-size: 16px; font-weight: 600; }
+        .stat-positive { color: #2dd4bf; }
+        .stat-negative { color: #f87171; }
+        .stat-neutral { color: #e1e4e8; }
+
+        /* Params table */
+        .params-table { width: 100%; border-collapse: collapse; }
+        .params-table th {
+            text-align: left; padding: 6px 8px;
+            color: #8b949e; font-size: 11px;
+            border-bottom: 1px solid #30363d;
+        }
+        .params-table td { padding: 6px 8px; border-bottom: 1px solid #21262d; }
+        .params-table input {
+            background: #0d1117; border: 1px solid #30363d;
+            color: #e1e4e8; padding: 4px 8px; border-radius: 4px;
+            width: 100px; font-family: inherit; font-size: 13px;
+        }
+        .params-table .desc { color: #8b949e; font-size: 11px; }
+
+        /* Buttons */
+        .btn {
+            padding: 6px 14px;
+            border-radius: 6px;
+            border: 1px solid #30363d;
+            background: #21262d;
+            color: #e1e4e8;
+            cursor: pointer;
+            font-size: 12px;
+            font-family: inherit;
+        }
+        .btn:hover { background: #30363d; }
+        .btn-primary { background: #1f6feb; border-color: #1f6feb; }
+        .btn-primary:hover { background: #388bfd; }
+
+        /* Positions table */
+        .positions-table { width: 100%; border-collapse: collapse; }
+        .positions-table th {
+            text-align: left; padding: 8px;
+            color: #8b949e; font-size: 11px;
+            border-bottom: 1px solid #30363d;
+        }
+        .positions-table td { padding: 8px; border-bottom: 1px solid #21262d; }
+
+        /* Signal log */
+        .signal-log {
+            max-height: 200px;
+            overflow-y: auto;
+            font-size: 12px;
+        }
+        .signal-entry {
+            padding: 4px 0;
+            border-bottom: 1px solid #21262d;
+        }
+        .signal-buy { color: #2dd4bf; }
+        .signal-sell { color: #f87171; }
+
+        /* Prices */
+        .price-row {
+            display: flex;
+            justify-content: space-between;
+            padding: 6px 0;
+            border-bottom: 1px solid #21262d;
+        }
+        .price-row:last-child { border-bottom: none; }
+
+        .section-title {
+            font-size: 14px;
+            font-weight: 600;
+            margin: 20px 0 12px 0;
+            color: #c9d1d9;
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>Trading Dashboard</h1>
+        <span id="ws-status" class="ws-status ws-disconnected">disconnected</span>
+    </div>
+
+    <div class="container">
+        <!-- Top row: processes + prices -->
+        <div class="grid grid-2" style="margin-bottom: 16px;">
+            <div class="card">
+                <div class="card-title">Processes</div>
+                <div id="processes"></div>
+            </div>
+            <div class="card">
+                <div class="card-title">Market Prices</div>
+                <div id="prices"></div>
+            </div>
+        </div>
+
+        <!-- Strategies -->
+        <div class="section-title">Strategies</div>
+        <div id="strategies"></div>
+    </div>
+
+    <script>
+        let ws;
+        let lastData = {};
+        const signalHistory = {};  // strategy_name -> [signals]
+
+        function connectWS() {
+            const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+            ws = new WebSocket(`${proto}://${location.host}/ws`);
+
+            ws.onopen = () => {
+                document.getElementById('ws-status').className = 'ws-status ws-connected';
+                document.getElementById('ws-status').textContent = 'live';
+            };
+
+            ws.onclose = () => {
+                document.getElementById('ws-status').className = 'ws-status ws-disconnected';
+                document.getElementById('ws-status').textContent = 'disconnected';
+                setTimeout(connectWS, 3000);
+            };
+
+            ws.onmessage = (event) => {
+                lastData = JSON.parse(event.data);
+                render(lastData);
+            };
+        }
+
+        function render(data) {
+            renderProcesses(data.heartbeats || {});
+            renderPrices(data.prices || {});
+            renderStrategies(data.strategies || {});
+        }
+
+        function renderProcesses(heartbeats) {
+            const expected = ['risk_engine', 'gateway_okx', 'gateway_futu', 'strategy_container', 'view_telegram'];
+            const html = expected.map(name => {
+                const hb = heartbeats[name];
+                const running = hb && parseInt(hb.ttl || 0) > 0;
+                return `<div class="process-row">
+                    <span>
+                        <span class="status-dot ${running ? 'status-running' : 'status-stopped'}"></span>
+                        ${name}
+                    </span>
+                    <span style="color: #8b949e">${running ? `pid ${hb.pid} | up ${formatUptime(hb.uptime)}` : 'stopped'}</span>
+                </div>`;
+            }).join('');
+            document.getElementById('processes').innerHTML = html;
+        }
+
+        function renderPrices(prices) {
+            if (Object.keys(prices).length === 0) {
+                document.getElementById('prices').innerHTML = '<div style="color: #8b949e">No market data</div>';
+                return;
+            }
+            const html = Object.entries(prices).map(([key, p]) => {
+                return `<div class="price-row">
+                    <span>${key}</span>
+                    <span>
+                        <span style="color: #2dd4bf">${parseFloat(p.bid).toFixed(2)}</span>
+                        /
+                        <span style="color: #f87171">${parseFloat(p.ask).toFixed(2)}</span>
+                        <span style="color: #8b949e; margin-left: 8px">last ${parseFloat(p.last).toFixed(2)}</span>
+                    </span>
+                </div>`;
+            }).join('');
+            document.getElementById('prices').innerHTML = html;
+        }
+
+        function renderStrategies(strategies) {
+            if (Object.keys(strategies).length === 0) {
+                document.getElementById('strategies').innerHTML =
+                    '<div class="card" style="color: #8b949e">No strategies loaded</div>';
+                return;
+            }
+
+            const html = Object.entries(strategies).map(([name, s]) => {
+                // Track signal history
+                if (s.last_signal && (!signalHistory[name] ||
+                    signalHistory[name].length === 0 ||
+                    signalHistory[name][signalHistory[name].length-1].timestamp !== s.last_signal.timestamp)) {
+                    if (!signalHistory[name]) signalHistory[name] = [];
+                    signalHistory[name].push(s.last_signal);
+                    if (signalHistory[name].length > 50) signalHistory[name].shift();
+                }
+
+                const totalPnl = Object.values(s.positions || {}).reduce((sum, qty) => sum + qty, 0);
+                const posCount = Object.keys(s.positions || {}).filter(k => s.positions[k] !== 0).length;
+
+                return `<div class="strategy-card">
+                    <div class="strategy-header">
+                        <div>
+                            <span class="strategy-name">${name}</span>
+                            <span class="strategy-meta" style="margin-left: 12px">${s.gateway} | ${s.symbols.join(', ')}</span>
+                        </div>
+                        <label class="toggle">
+                            <input type="checkbox" ${s.enabled ? 'checked' : ''} onchange="toggleStrategy('${name}', this.checked)">
+                            <span class="slider"></span>
+                        </label>
+                    </div>
+
+                    <div class="stats">
+                        <div class="stat-box">
+                            <div class="stat-label">Status</div>
+                            <div class="stat-value ${s.enabled ? 'stat-positive' : 'stat-negative'}">
+                                ${s.enabled ? 'ACTIVE' : 'DISABLED'}
+                            </div>
+                        </div>
+                        <div class="stat-box">
+                            <div class="stat-label">Ticks</div>
+                            <div class="stat-value stat-neutral">${(s.tick_count || 0).toLocaleString()}</div>
+                        </div>
+                        <div class="stat-box">
+                            <div class="stat-label">Signals</div>
+                            <div class="stat-value stat-neutral">${s.signal_count || 0}</div>
+                        </div>
+                        <div class="stat-box">
+                            <div class="stat-label">Positions</div>
+                            <div class="stat-value ${posCount > 0 ? 'stat-positive' : 'stat-neutral'}">${posCount > 0 ? posCount + ' open' : 'flat'}</div>
+                        </div>
+                    </div>
+
+                    ${renderPositions(s.positions)}
+                    ${renderParams(name, s.params, s.params_schema)}
+                    ${renderSignalLog(name)}
+                </div>`;
+            }).join('');
+
+            document.getElementById('strategies').innerHTML = html;
+        }
+
+        function renderPositions(positions) {
+            const entries = Object.entries(positions || {}).filter(([, qty]) => qty !== 0);
+            if (entries.length === 0) return '';
+
+            const rows = entries.map(([symbol, qty]) => {
+                const side = qty > 0 ? 'LONG' : 'SHORT';
+                const color = qty > 0 ? 'stat-positive' : 'stat-negative';
+                return `<tr>
+                    <td>${symbol}</td>
+                    <td class="${color}">${side}</td>
+                    <td>${Math.abs(qty)}</td>
+                </tr>`;
+            }).join('');
+
+            return `<table class="positions-table" style="margin-bottom: 12px">
+                <tr><th>Symbol</th><th>Side</th><th>Quantity</th></tr>
+                ${rows}
+            </table>`;
+        }
+
+        function renderParams(strategyName, params, schema) {
+            if (!params || Object.keys(params).length === 0) return '';
+
+            const rows = Object.entries(params).map(([key, value]) => {
+                const desc = (schema && schema[key]) ? schema[key].desc : '';
+                return `<tr>
+                    <td><strong>${key}</strong></td>
+                    <td><input type="text" id="param-${strategyName}-${key}" value="${value}" /></td>
+                    <td class="desc">${desc}</td>
+                </tr>`;
+            }).join('');
+
+            return `<table class="params-table" style="margin-bottom: 12px">
+                <tr><th>Parameter</th><th>Value</th><th>Description</th></tr>
+                ${rows}
+            </table>
+            <button class="btn btn-primary" onclick="saveParams('${strategyName}', ${JSON.stringify(Object.keys(params))})">
+                Save Parameters
+            </button>`;
+        }
+
+        function renderSignalLog(strategyName) {
+            const signals = signalHistory[strategyName] || [];
+            if (signals.length === 0) return '<div style="color: #8b949e; margin-top: 12px; font-size: 12px">No signals yet</div>';
+
+            const rows = signals.slice().reverse().map(s => {
+                const time = new Date(s.timestamp * 1000).toLocaleTimeString();
+                const cls = s.side === 'buy' ? 'signal-buy' : 'signal-sell';
+                return `<div class="signal-entry">
+                    <span style="color: #8b949e">${time}</span>
+                    <span class="${cls}" style="margin-left: 8px; font-weight: 600">${s.side.toUpperCase()}</span>
+                    <span style="margin-left: 8px">${s.symbol || ''} @ ${parseFloat(s.price || 0).toFixed(2)}</span>
+                    <span style="margin-left: 8px; color: #8b949e">qty=${s.quantity}</span>
+                    <span style="margin-left: 8px; color: #8b949e">${s.reason || ''}</span>
+                </div>`;
+            }).join('');
+
+            return `<div style="margin-top: 12px">
+                <div style="font-size: 11px; color: #8b949e; margin-bottom: 4px">SIGNAL LOG</div>
+                <div class="signal-log">${rows}</div>
+            </div>`;
+        }
+
+        // Actions
+        async function toggleStrategy(name, enabled) {
+            const action = enabled ? 'enable' : 'disable';
+            await fetch(`/api/strategy/${name}/${action}`, { method: 'POST' });
+        }
+
+        async function saveParams(strategyName, paramKeys) {
+            const params = {};
+            paramKeys.forEach(key => {
+                const input = document.getElementById(`param-${strategyName}-${key}`);
+                if (input) params[key] = input.value;
+            });
+            await fetch(`/api/strategy/${strategyName}/params`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(params),
+            });
+        }
+
+        function formatUptime(seconds) {
+            const s = parseFloat(seconds);
+            if (s < 60) return `${s.toFixed(0)}s`;
+            if (s < 3600) return `${(s/60).toFixed(1)}m`;
+            if (s < 86400) return `${(s/3600).toFixed(1)}h`;
+            return `${(s/86400).toFixed(1)}d`;
+        }
+
+        // Start
+        connectWS();
+    </script>
+</body>
+</html>

@@ -15,6 +15,12 @@ class MomentumStrategy(BaseStrategy):
     Flat position before reversing.
     """
 
+    PARAMS_SCHEMA = {
+        "lookback": {"type": "int", "desc": "Number of ticks for momentum window"},
+        "threshold": {"type": "float", "desc": "Momentum threshold (e.g. 0.02 = 2%)"},
+        "order_size": {"type": "float", "desc": "Base order size"},
+    }
+
     def __init__(self, name: str, gateway: str, symbols: list[str],
                  lookback: int = 20, threshold: float = 0.02,
                  order_size: float = 0.01):
