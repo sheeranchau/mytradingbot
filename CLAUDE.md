@@ -6,11 +6,21 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Multi-process Python trading system for crypto (OKX) and equities (FUTU — US/HK markets). Processes communicate via ZeroMQ (hot path: ticks, orders, kills) and Redis (warm path: positions, config, trade log, PnL).
 
+## Setup & Deployment
+
+```bash
+# Full setup (works on macOS and Ubuntu/Debian)
+bash scripts/setup.sh
+
+# Verify environment without installing
+bash scripts/setup.sh --check
+```
+
+The setup script handles: Python check, Redis install+start, pip dependencies, .env template, directory creation, and runs tests. See `scripts/setup.sh`.
+
 ## Commands
 
 ```bash
-# Install dependencies
-pip install -r requirements.txt
 
 # Process management (supervisor)
 python supervisor.py start all          # start all processes in order
@@ -25,7 +35,18 @@ python -m risk.runner
 python -m gateway.okx_runner
 python -m strategy.runner
 python -m view.telegram_runner
+
+# Tests
+python3 -m pytest tests/ -v              # all tests
+python3 -m pytest tests/ -v -k "not redis"  # skip Redis-dependent tests
+python3 -m pytest tests/test_risk_engine.py -v  # single file
 ```
+
+## Trading Mode
+
+Configured per gateway in `config/settings.yaml`:
+- **OKX**: `simulated: true` = demo (`wspap.okx.com`), `false` = REAL MONEY
+- **FUTU**: `trade_env: "SIMULATE"` = paper, `"REAL"` = REAL MONEY (requires unlock password)
 
 ## Architecture
 
