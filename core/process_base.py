@@ -7,10 +7,9 @@ import os
 import signal
 import time
 from abc import ABC, abstractmethod
-from typing import Optional
 
-from core.zmq_channels import Publisher, HEARTBEAT_PORT
 from core.redis_store import RedisStore
+from core.logger import get_logger
 
 
 class ProcessBase(ABC):
@@ -22,14 +21,14 @@ class ProcessBase(ABC):
         self.start_time = time.time()
         self.running = False
         self.redis = RedisStore(url=redis_url)
-        self._heartbeat_pub: Optional[Publisher] = None
+        self.logger = get_logger(process_name)
         self._heartbeat_interval = 5.0  # seconds
 
     async def start(self) -> None:
         """Start the process: connect resources, run main loop."""
         self.running = True
         await self.redis.connect()
-        self._heartbeat_pub = Publisher(HEARTBEAT_PORT)
+        self.logger.info("Process started (pid=%d)", self.pid)
 
         # Register signal handlers
         loop = asyncio.get_event_loop()
@@ -44,14 +43,13 @@ class ProcessBase(ABC):
 
     async def stop(self) -> None:
         """Graceful shutdown."""
+        self.logger.info("Process stopping...")
         self.running = False
         await self.on_stop()
-        if self._heartbeat_pub:
-            self._heartbeat_pub.close()
         await self.redis.close()
 
     async def _heartbeat_loop(self) -> None:
-        """Publish heartbeat to ZMQ and Redis."""
+        """Publish heartbeat to Redis."""
         while self.running:
             info = {
                 "process_name": self.process_name,
@@ -59,9 +57,6 @@ class ProcessBase(ABC):
                 "uptime": str(round(time.time() - self.start_time, 1)),
                 "timestamp": str(time.time()),
             }
-            await self._heartbeat_pub.publish(
-                f"heartbeat.{self.process_name}", info
-            )
             await self.redis.set_heartbeat(self.process_name, info)
             await asyncio.sleep(self._heartbeat_interval)
 
