@@ -60,14 +60,20 @@ class OKXGateway(BaseGateway):
         self._session = aiohttp.ClientSession(headers=headers)
 
         # Connect public websocket
+        self.logger.info("Connecting public WS: %s", self.WS_PUBLIC)
         self._ws_public = await self._session.ws_connect(self.WS_PUBLIC)
+        self.logger.info("Public WS connected")
 
         # Connect and authenticate private websocket
+        self.logger.info("Connecting private WS: %s", self.WS_PRIVATE)
         self._ws_private = await self._session.ws_connect(self.WS_PRIVATE)
+        self.logger.info("Private WS connected, authenticating...")
         await self._authenticate()
+        self.logger.info("Authentication successful")
 
         # Subscribe to private channels (orders, positions)
         await self._subscribe_private()
+        self.logger.info("Subscribed to %d symbols: %s", len(self.symbols), self.symbols)
 
     async def _authenticate(self) -> None:
         timestamp = str(int(time.time()))

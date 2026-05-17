@@ -50,13 +50,7 @@ def get_logger(
 
     formatter = logging.Formatter(LOG_FORMAT, datefmt=LOG_DATE_FORMAT)
 
-    # Console handler
-    console = logging.StreamHandler(sys.stdout)
-    console.setFormatter(formatter)
-    console.setLevel(resolved_level)
-    logger.addHandler(console)
-
-    # File handler with daily rotation
+    # File handler with daily rotation (primary output)
     if log_file:
         log_path = LOG_DIR / f"{name}.log"
         file_handler = TimedRotatingFileHandler(
