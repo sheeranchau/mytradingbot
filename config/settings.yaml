@@ -1,0 +1,67 @@
+# Trading System Configuration
+#
+# TRADING MODE: Set per gateway below.
+#   OKX:  simulated: true  -> demo trading (wspap.okx.com, x-simulated-trading header)
+#         simulated: false -> REAL money
+#   FUTU: trade_env: "SIMULATE" -> paper trading via OpenD
+#         trade_env: "REAL"     -> REAL money (requires unlock password)
+
+redis:
+  url: "redis://127.0.0.1:6379"
+  db: 0
+
+# Exchange gateways
+gateways:
+  okx:
+    api_key: "${OKX_API_KEY}"
+    secret_key: "${OKX_SECRET_KEY}"
+    passphrase: "${OKX_PASSPHRASE}"
+    simulated: true  # <-- true = demo, false = REAL MONEY
+    symbols:
+      - "BTC-USDT-SWAP"
+      - "ETH-USDT-SWAP"
+
+  futu:
+    host: "127.0.0.1"
+    port: 11111
+    market: "US"  # US or HK
+    trade_env: "SIMULATE"  # <-- SIMULATE = paper, REAL = REAL MONEY
+    unlock_password: "${FUTU_UNLOCK_PWD}"  # required for REAL mode
+    symbols:
+      - "US.AAPL"
+      - "US.TSLA"
+
+# Strategies
+strategies:
+  example_momentum:
+    class: "strategy.examples.MomentumStrategy"
+    gateway: "okx"
+    symbols:
+      - "BTC-USDT-SWAP"
+    params:
+      lookback: 20
+      threshold: 0.02
+
+# Risk limits (per strategy)
+risk:
+  default:
+    max_position_size: 1.0
+    max_notional: 50000
+    max_daily_loss: 1000
+    max_daily_loss_pct: 2.0
+    max_delta: 5.0
+    max_order_rate: 60
+    max_drawdown_pct: 5.0
+
+  example_momentum:
+    max_position_size: 0.5
+    max_notional: 25000
+    max_daily_loss: 500
+    max_order_rate: 30
+
+# View / Reporting
+view:
+  telegram:
+    bot_token: "${TELEGRAM_BOT_TOKEN}"
+    chat_id: "${TELEGRAM_CHAT_ID}"
+    summary_interval: 300  # seconds
