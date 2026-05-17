@@ -13,6 +13,7 @@ from core.zmq_channels import (
     SIGNAL_PORT, ORDER_PORT, RISK_KILL_PORT, MARKET_DATA_PORT
 )
 from core.events import EventType
+from core.logger import get_logger
 
 
 @dataclass
@@ -41,6 +42,7 @@ class RiskEngine(ProcessBase):
 
     def __init__(self, **kwargs):
         super().__init__(process_name="risk_engine", **kwargs)
+        self.logger = get_logger("risk_engine")
         self._strategy_states: dict[str, StrategyRiskState] = {}
 
     async def run(self) -> None:
@@ -74,7 +76,7 @@ class RiskEngine(ProcessBase):
                     }
                     await order_pusher.push(order)
             except Exception as e:
-                print(f"[RiskEngine] Signal processing error: {e}")
+                self.logger.error("Signal processing error: %s", e)
                 await asyncio.sleep(0.1)
 
     async def _check_signal(self, signal: dict, kill_pub: Publisher) -> bool:
@@ -110,7 +112,7 @@ class RiskEngine(ProcessBase):
 
         max_notional = float(limits.get("max_notional", 0))
         if max_notional > 0 and notional > max_notional:
-            print(f"[RiskEngine] Signal rejected: notional {notional} > {max_notional}")
+            self.logger.warning("Signal rejected: notional %s > %s", notional, max_notional)
             return False
 
         # Check daily loss
@@ -150,7 +152,7 @@ class RiskEngine(ProcessBase):
                 elif event_type == EventType.TICK:
                     await self._on_tick(data, kill_pub)
             except Exception as e:
-                print(f"[RiskEngine] Monitor error: {e}")
+                self.logger.error("Monitor error: %s", e)
                 await asyncio.sleep(0.1)
 
     async def _on_fill(self, fill: dict) -> None:
@@ -192,7 +194,7 @@ class RiskEngine(ProcessBase):
             "timestamp": time.time(),
             "flatten": True,
         })
-        print(f"[RiskEngine] KILLED strategy '{strategy}': {reason}")
+        self.logger.critical("KILLED strategy '%s': %s", strategy, reason)
 
     async def kill_all(self, kill_pub: Publisher, reason: str) -> None:
         """Emergency: kill all strategies."""
@@ -207,7 +209,7 @@ class RiskEngine(ProcessBase):
             "timestamp": time.time(),
             "flatten": True,
         })
-        print(f"[RiskEngine] KILLED ALL STRATEGIES: {reason}")
+        self.logger.critical("KILLED ALL STRATEGIES: %s", reason)
 
     def _get_state(self, strategy_name: str) -> StrategyRiskState:
         if strategy_name not in self._strategy_states:

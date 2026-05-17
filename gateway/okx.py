@@ -48,7 +48,7 @@ class OKXGateway(BaseGateway):
             self.REST_BASE = self.LIVE_REST_BASE
 
         mode = "DEMO" if simulated else "LIVE"
-        print(f"[OKX] Initialized in {mode} mode")
+        self.logger.info("Initialized in %s mode", mode)
         self._ws_public: Optional[aiohttp.ClientWebSocketResponse] = None
         self._ws_private: Optional[aiohttp.ClientWebSocketResponse] = None
         self._session: Optional[aiohttp.ClientSession] = None
@@ -119,7 +119,7 @@ class OKXGateway(BaseGateway):
                 elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
                     break
             except Exception as e:
-                print(f"[OKX] Public WS error: {e}")
+                self.logger.error("Public WS error: %s", e)
                 await asyncio.sleep(1)
 
     async def _handle_public_msg(self, data: dict) -> None:
@@ -157,7 +157,7 @@ class OKXGateway(BaseGateway):
                 elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
                     break
             except Exception as e:
-                print(f"[OKX] Private WS error: {e}")
+                self.logger.error("Private WS error: %s", e)
                 await asyncio.sleep(1)
 
     async def _handle_private_msg(self, data: dict) -> None:
@@ -195,7 +195,7 @@ class OKXGateway(BaseGateway):
             order_id = resp["data"][0]["ordId"]
             return order_id
         else:
-            print(f"[OKX] Order failed: {resp}")
+            self.logger.error("Order failed: %s", resp)
             return ""
 
     async def cancel_order(self, order_id: str) -> None:

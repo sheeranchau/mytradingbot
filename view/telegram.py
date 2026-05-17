@@ -10,6 +10,7 @@ import aiohttp
 
 from core.process_base import ProcessBase
 from core.zmq_channels import Subscriber, MARKET_DATA_PORT, RISK_KILL_PORT
+from core.logger import get_logger
 
 
 class TelegramReporter(ProcessBase):
@@ -23,6 +24,7 @@ class TelegramReporter(ProcessBase):
     def __init__(self, bot_token: str, chat_id: str,
                  summary_interval: float = 300.0, **kwargs):
         super().__init__(process_name="view_telegram", **kwargs)
+        self.logger = get_logger("view_telegram")
         self.bot_token = bot_token
         self.chat_id = chat_id
         self.summary_interval = summary_interval
@@ -55,7 +57,7 @@ class TelegramReporter(ProcessBase):
                 )
                 await self._send_message(msg)
             except Exception as e:
-                print(f"[Telegram] Fill listener error: {e}")
+                self.logger.error("Fill listener error: %s", e)
                 await asyncio.sleep(1)
 
     async def _listen_kills(self, sub: Subscriber) -> None:
@@ -67,7 +69,7 @@ class TelegramReporter(ProcessBase):
                 msg = f"RISK KILL: Strategy={strategy}, Reason={reason}"
                 await self._send_message(msg)
             except Exception as e:
-                print(f"[Telegram] Kill listener error: {e}")
+                self.logger.error("Kill listener error: %s", e)
                 await asyncio.sleep(1)
 
     async def _periodic_summary(self) -> None:
@@ -97,7 +99,7 @@ class TelegramReporter(ProcessBase):
 
                 await self._send_message("\n".join(lines))
             except Exception as e:
-                print(f"[Telegram] Summary error: {e}")
+                self.logger.error("Summary error: %s", e)
 
     async def _poll_commands(self) -> None:
         """Poll Telegram for bot commands."""
@@ -112,7 +114,7 @@ class TelegramReporter(ProcessBase):
                             self._last_update_id = update["update_id"]
                             await self._handle_command(update)
             except Exception as e:
-                print(f"[Telegram] Poll error: {e}")
+                self.logger.error("Poll error: %s", e)
                 await asyncio.sleep(5)
 
     async def _handle_command(self, update: dict) -> None:
@@ -157,9 +159,9 @@ class TelegramReporter(ProcessBase):
         try:
             async with self._session.post(url, json=payload) as resp:
                 if resp.status != 200:
-                    print(f"[Telegram] Send failed: {await resp.text()}")
+                    self.logger.warning("Send failed: %s", await resp.text())
         except Exception as e:
-            print(f"[Telegram] Send error: {e}")
+            self.logger.error("Send error: %s", e)
 
     async def on_stop(self) -> None:
         if self._session:

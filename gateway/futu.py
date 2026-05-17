@@ -38,7 +38,7 @@ class FUTUGateway(BaseGateway):
         self.unlock_password = unlock_password
 
         mode = "PAPER" if trade_env == "SIMULATE" else "REAL"
-        print(f"[FUTU] Initialized in {mode} mode, market={market}")
+        self.logger.info("Initialized in %s mode, market=%s", mode, market)
         self._quote_ctx: Optional[object] = None
         self._trade_ctx: Optional[object] = None
 
@@ -76,7 +76,7 @@ class FUTUGateway(BaseGateway):
                     if quote:
                         await self.publish_tick(symbol, quote)
                 except Exception as e:
-                    print(f"[FUTU] Quote error for {symbol}: {e}")
+                    self.logger.error("Quote error for %s: %s", symbol, e)
             await asyncio.sleep(0.5)  # polling interval
 
     def _get_quote(self, symbol: str) -> Optional[dict]:
@@ -115,7 +115,7 @@ class FUTUGateway(BaseGateway):
         if ret == RET_OK:
             return str(data.iloc[0]["order_id"])
         else:
-            print(f"[FUTU] Order failed: {data}")
+            self.logger.error("Order failed: %s", data)
             return ""
 
     async def cancel_order(self, order_id: str) -> None:

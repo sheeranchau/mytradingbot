@@ -7,6 +7,7 @@ from dataclasses import asdict
 from core.process_base import ProcessBase
 from core.zmq_channels import Publisher, Puller, MARKET_DATA_PORT, ORDER_PORT
 from core.events import EventType
+from core.logger import get_logger
 
 
 class BaseGateway(ProcessBase, ABC):
@@ -21,6 +22,7 @@ class BaseGateway(ProcessBase, ABC):
     def __init__(self, gateway_name: str, **kwargs):
         super().__init__(process_name=f"gateway_{gateway_name}", **kwargs)
         self.gateway_name = gateway_name
+        self.logger = get_logger(f"gateway_{gateway_name}")
         self._market_pub: Publisher | None = None
         self._order_puller: Puller | None = None
 
@@ -48,7 +50,7 @@ class BaseGateway(ProcessBase, ABC):
                     elif event_type == EventType.ORDER_CANCEL:
                         await self.cancel_order(order_data.get("order_id", ""))
             except Exception as e:
-                print(f"[{self.gateway_name}] Order listener error: {e}")
+                self.logger.error("Order listener error: %s", e)
                 await asyncio.sleep(1)
 
     async def publish_tick(self, symbol: str, tick: dict) -> None:

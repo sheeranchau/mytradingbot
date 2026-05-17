@@ -10,6 +10,7 @@ from core.zmq_channels import (
     Subscriber, Pusher, MARKET_DATA_PORT, SIGNAL_PORT, RISK_KILL_PORT
 )
 from core.events import EventType
+from core.logger import get_logger
 from strategy.base import BaseStrategy
 
 
@@ -24,6 +25,7 @@ class StrategyContainer(ProcessBase):
 
     def __init__(self, strategies: list[BaseStrategy], **kwargs):
         super().__init__(process_name="strategy_container", **kwargs)
+        self.logger = get_logger("strategy_container")
         self.strategies = {s.name: s for s in strategies}
         # Build routing table: (gateway, symbol) -> [strategy_name, ...]
         self._routes: dict[tuple[str, str], list[str]] = {}
@@ -47,7 +49,7 @@ class StrategyContainer(ProcessBase):
                 topic, data = await market_sub.receive()
                 await self._dispatch(topic, data, signal_push)
             except Exception as e:
-                print(f"[StrategyContainer] Error: {e}")
+                self.logger.error("Dispatch error: %s", e)
                 await asyncio.sleep(0.1)
 
     async def _dispatch(self, topic: str, data: dict, signal_push: Pusher) -> None:
@@ -98,12 +100,12 @@ class StrategyContainer(ProcessBase):
                 if target:
                     if target in self.strategies:
                         self.strategies[target].enabled = False
-                        print(f"[StrategyContainer] Strategy '{target}' killed: {reason}")
+                        self.logger.warning("Strategy '%s' killed: %s", target, reason)
                 else:
                     # Kill all
                     for s in self.strategies.values():
                         s.enabled = False
-                    print(f"[StrategyContainer] ALL strategies killed: {reason}")
+                    self.logger.critical("ALL strategies killed: %s", reason)
             except Exception as e:
-                print(f"[StrategyContainer] Kill listener error: {e}")
+                self.logger.error("Kill listener error: %s", e)
                 await asyncio.sleep(1)

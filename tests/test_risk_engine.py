@@ -40,8 +40,10 @@ class MockRedisStore:
 
 def make_engine(limits: dict = None) -> RiskEngine:
     """Create a RiskEngine with mocked Redis."""
+    from core.logger import get_logger
     engine = RiskEngine.__new__(RiskEngine)
     engine.process_name = "risk_engine"
+    engine.logger = get_logger("risk_engine_test", log_file=False)
     engine.running = True
     engine.redis = MockRedisStore(limits)
     engine._strategy_states = {}
