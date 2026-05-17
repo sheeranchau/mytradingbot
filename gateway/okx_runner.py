@@ -1,14 +1,13 @@
 """Entry point for OKX gateway process."""
 import asyncio
 import os
-import yaml
 
+from core.config import load_settings
 from gateway.okx import OKXGateway
 
 
 def main():
-    with open("config/settings.yaml") as f:
-        config = yaml.safe_load(f)
+    config = load_settings()
 
     okx_cfg = config["gateways"]["okx"]
     gateway = OKXGateway(

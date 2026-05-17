@@ -1,14 +1,13 @@
 """Entry point for Telegram view process."""
 import asyncio
 import os
-import yaml
 
+from core.config import load_settings
 from view.telegram import TelegramReporter
 
 
 def main():
-    with open("config/settings.yaml") as f:
-        config = yaml.safe_load(f)
+    config = load_settings()
 
     tg_cfg = config["view"]["telegram"]
     reporter = TelegramReporter(

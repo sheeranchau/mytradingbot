@@ -1,14 +1,13 @@
 """Entry point for FUTU gateway process."""
 import asyncio
 import os
-import yaml
 
+from core.config import load_settings
 from gateway.futu import FUTUGateway
 
 
 def main():
-    with open("config/settings.yaml") as f:
-        config = yaml.safe_load(f)
+    config = load_settings()
 
     futu_cfg = config["gateways"]["futu"]
     gateway = FUTUGateway(

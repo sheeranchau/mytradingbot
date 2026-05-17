@@ -1,16 +1,14 @@
 """Entry point for strategy container process."""
 import asyncio
-import yaml
 import importlib
-from pathlib import Path
 
+from core.config import load_settings
 from strategy.container import StrategyContainer
 
 
-def load_strategies(config_path: str = "config/settings.yaml") -> list:
+def load_strategies() -> list:
     """Load strategy instances from config."""
-    with open(config_path) as f:
-        config = yaml.safe_load(f)
+    config = load_settings()
 
     strategies = []
     for name, strat_config in config.get("strategies", {}).items():
