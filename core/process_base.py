@@ -7,6 +7,7 @@ import os
 import signal
 import time
 from abc import ABC, abstractmethod
+from typing import Optional
 
 from core.zmq_channels import Publisher, HEARTBEAT_PORT
 from core.redis_store import RedisStore
@@ -21,7 +22,7 @@ class ProcessBase(ABC):
         self.start_time = time.time()
         self.running = False
         self.redis = RedisStore(url=redis_url)
-        self._heartbeat_pub: Publisher | None = None
+        self._heartbeat_pub: Optional[Publisher] = None
         self._heartbeat_interval = 5.0  # seconds
 
     async def start(self) -> None:

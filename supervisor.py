@@ -50,7 +50,7 @@ def get_pidfile(name: str) -> Path:
     return PIDFILE_DIR / f"{name}.pid"
 
 
-def read_pid(name: str) -> int | None:
+def read_pid(name: str):
     pidfile = get_pidfile(name)
     if pidfile.exists():
         try:

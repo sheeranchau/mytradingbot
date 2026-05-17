@@ -23,8 +23,8 @@ class BaseGateway(ProcessBase, ABC):
         super().__init__(process_name=f"gateway_{gateway_name}", **kwargs)
         self.gateway_name = gateway_name
         self.logger = get_logger(f"gateway_{gateway_name}")
-        self._market_pub: Publisher | None = None
-        self._order_puller: Puller | None = None
+        self._market_pub = None
+        self._order_puller = None
 
     async def run(self) -> None:
         self._market_pub = Publisher(MARKET_DATA_PORT)
