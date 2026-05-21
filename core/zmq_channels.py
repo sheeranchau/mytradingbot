@@ -9,11 +9,25 @@ from typing import Optional
 
 
 # --- Port assignments ---
-# Market data: PUB/SUB
-MARKET_DATA_PORT = 15555
+# Per-gateway ports — each gateway owns its own market-data PUB and orders PULL.
+# Subscribers (strategy, risk, view) use MultiSubscriber to merge feeds.
+# Risk engine keeps one Pusher per gateway, picks by order["gateway"].
+GATEWAY_PORTS = {
+    "okx":    {"market_data": 15555, "orders": 15557},
+    "futu":   {"market_data": 15565, "orders": 15567},
+    "webull": {"market_data": 15575, "orders": 15577},
+}
+
+# Convenience flat lists for MultiSubscriber / multi-Pusher consumers
+GATEWAY_MARKET_DATA_PORTS = [p["market_data"] for p in GATEWAY_PORTS.values()]
+GATEWAY_ORDER_PORTS = {gw: p["orders"] for gw, p in GATEWAY_PORTS.items()}
+
+# Legacy aliases (default to OKX); new code should use GATEWAY_PORTS
+MARKET_DATA_PORT = GATEWAY_PORTS["okx"]["market_data"]
+ORDER_PORT = GATEWAY_PORTS["okx"]["orders"]
+
 # Order flow: strategy -> risk -> gateway (PUSH/PULL pipeline)
 SIGNAL_PORT = 15556       # strategy pushes signals
-ORDER_PORT = 15557        # risk pushes validated orders to gateway
 # Risk kill: PUB/SUB (risk publishes kill signals, all subscribe)
 RISK_KILL_PORT = 15558
 # Heartbeat: PUB/SUB (all processes publish, supervisor subscribes)
@@ -50,6 +64,30 @@ class Subscriber:
         self.ctx = ctx or zmq.asyncio.Context.instance()
         self.socket = self.ctx.socket(zmq.SUB)
         self.socket.connect(get_address(port))
+        topics = topics or [""]
+        for topic in topics:
+            self.socket.setsockopt_string(zmq.SUBSCRIBE, topic)
+
+    async def receive(self) -> tuple[str, dict]:
+        topic_bytes, payload = await self.socket.recv_multipart()
+        data = msgpack.unpackb(payload, raw=False)
+        return topic_bytes.decode(), data
+
+    def close(self):
+        self.socket.close()
+
+
+class MultiSubscriber:
+    """SUB socket connected to multiple endpoints (one per gateway).
+    ZMQ allows a single SUB to connect to multiple PUB endpoints; messages
+    from all of them are interleaved on the same recv() stream."""
+
+    def __init__(self, ports: list, topics: list = None,
+                 ctx: Optional[zmq.asyncio.Context] = None):
+        self.ctx = ctx or zmq.asyncio.Context.instance()
+        self.socket = self.ctx.socket(zmq.SUB)
+        for port in ports:
+            self.socket.connect(get_address(port))
         topics = topics or [""]
         for topic in topics:
             self.socket.setsockopt_string(zmq.SUBSCRIBE, topic)

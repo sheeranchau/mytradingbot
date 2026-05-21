@@ -112,6 +112,13 @@ OKX_PASSPHRASE=
 # FUTU OpenD (optional)
 FUTU_UNLOCK_PWD=
 
+# Webull (optional — market-data-only without these)
+WEBULL_EMAIL=
+WEBULL_PASSWORD=
+WEBULL_TRADE_PIN=
+WEBULL_MFA_SEED=
+WEBULL_DID=
+
 # Telegram Bot (optional)
 TELEGRAM_BOT_TOKEN=
 TELEGRAM_CHAT_ID=

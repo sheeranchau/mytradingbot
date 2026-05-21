@@ -188,6 +188,174 @@
             margin: 20px 0 12px 0;
             color: #c9d1d9;
         }
+
+        /* Tab navigation */
+        .tabs {
+            background: #161b22;
+            border-bottom: 1px solid #30363d;
+            padding: 0 24px;
+            display: flex;
+            gap: 0;
+        }
+        .tab-btn {
+            padding: 10px 20px;
+            border: none;
+            background: none;
+            color: #8b949e;
+            cursor: pointer;
+            font-family: inherit;
+            font-size: 13px;
+            border-bottom: 2px solid transparent;
+            margin-bottom: -1px;
+        }
+        .tab-btn:hover { color: #e1e4e8; }
+        .tab-btn.active { color: #58a6ff; border-bottom-color: #58a6ff; }
+        .tab-pane { display: none; }
+        .tab-pane.active { display: block; }
+
+        /* Market depth */
+        .depth-toolbar {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            margin-bottom: 16px;
+            flex-wrap: wrap;
+        }
+        .depth-select {
+            background: #0d1117;
+            border: 1px solid #30363d;
+            color: #e1e4e8;
+            padding: 6px 10px;
+            border-radius: 6px;
+            font-family: inherit;
+            font-size: 13px;
+        }
+        .depth-search-wrap {
+            position: relative;
+            display: flex;
+            align-items: center;
+        }
+        .depth-search {
+            background: #0d1117;
+            border: 1px solid #30363d;
+            color: #e1e4e8;
+            padding: 6px 10px;
+            border-radius: 6px;
+            font-family: inherit;
+            font-size: 13px;
+            width: 200px;
+        }
+        .depth-search:focus { outline: none; border-color: #58a6ff; }
+        .depth-search-results {
+            position: absolute;
+            top: 100%;
+            left: 0;
+            z-index: 100;
+            background: #161b22;
+            border: 1px solid #30363d;
+            border-radius: 6px;
+            width: 260px;
+            max-height: 240px;
+            overflow-y: auto;
+            display: none;
+        }
+        .depth-search-results.open { display: block; }
+        .search-item {
+            padding: 7px 12px;
+            cursor: pointer;
+            font-size: 13px;
+            border-bottom: 1px solid #21262d;
+        }
+        .search-item:last-child { border-bottom: none; }
+        .search-item:hover { background: #21262d; }
+        .search-item .inst-id { color: #e1e4e8; }
+        .search-item .inst-sub { color: #8b949e; font-size: 11px; margin-left: 8px; }
+        .selected-symbol {
+            background: #1b4332;
+            border: 1px solid #2dd4bf44;
+            color: #2dd4bf;
+            padding: 5px 12px;
+            border-radius: 6px;
+            font-size: 13px;
+            min-width: 160px;
+        }
+        /* Env toggle */
+        .env-toggle {
+            display: flex;
+            border: 1px solid #30363d;
+            border-radius: 6px;
+            overflow: hidden;
+        }
+        .env-btn {
+            padding: 5px 14px;
+            border: none;
+            background: #0d1117;
+            color: #8b949e;
+            cursor: pointer;
+            font-family: inherit;
+            font-size: 12px;
+            font-weight: 600;
+            letter-spacing: 0.4px;
+        }
+        .env-btn + .env-btn { border-left: 1px solid #30363d; }
+        .env-btn.active[data-env="PAPER"] { background: #1b3a5c; color: #58a6ff; }
+        .env-btn.active[data-env="LIVE"]  { background: #3d1a1a; color: #f87171; }
+
+        .depth-status {
+            font-size: 12px;
+            color: #8b949e;
+        }
+        .depth-status.live { color: #2dd4bf; }
+        .depth-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 12px;
+        }
+        .depth-table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+        .depth-table th {
+            text-align: right;
+            padding: 6px 10px;
+            color: #8b949e;
+            font-size: 11px;
+            border-bottom: 1px solid #30363d;
+        }
+        .depth-table th:first-child { text-align: left; }
+        .depth-table td {
+            padding: 5px 10px;
+            border-bottom: 1px solid #21262d;
+            text-align: right;
+            font-variant-numeric: tabular-nums;
+        }
+        .depth-table td:first-child { text-align: left; }
+        .depth-table tr:last-child td { border-bottom: none; }
+        .bid-price { color: #2dd4bf; }
+        .ask-price { color: #f87171; }
+        .depth-bar-cell { position: relative; }
+        .depth-bar {
+            position: absolute;
+            top: 0; bottom: 0;
+            opacity: 0.12;
+            border-radius: 2px;
+        }
+        .bid-bar { background: #2dd4bf; right: 0; }
+        .ask-bar { background: #f87171; left: 0; }
+        .depth-empty {
+            color: #8b949e;
+            text-align: center;
+            padding: 40px 0;
+        }
+        .spread-row {
+            text-align: center;
+            padding: 8px;
+            color: #8b949e;
+            font-size: 12px;
+            background: #0d1117;
+            border-radius: 4px;
+            margin: 8px 0;
+        }
     </style>
 </head>
 <body>
@@ -196,28 +364,72 @@
         <span id="ws-status" class="ws-status ws-disconnected">disconnected</span>
     </div>
 
-    <div class="container">
-        <!-- Top row: processes + prices -->
-        <div class="grid grid-2" style="margin-bottom: 16px;">
-            <div class="card">
-                <div class="card-title">Processes</div>
-                <div id="processes"></div>
+    <div class="tabs">
+        <button class="tab-btn active" onclick="switchTab('dashboard')">Dashboard</button>
+        <button class="tab-btn" onclick="switchTab('depth')">Market Depth</button>
+    </div>
+
+    <!-- Dashboard tab -->
+    <div id="tab-dashboard" class="tab-pane active">
+        <div class="container">
+            <!-- Top row: processes + prices -->
+            <div class="grid grid-2" style="margin-bottom: 16px;">
+                <div class="card">
+                    <div class="card-title">Processes</div>
+                    <div id="processes"></div>
+                </div>
+                <div class="card">
+                    <div class="card-title">Market Prices</div>
+                    <div id="prices"></div>
+                </div>
             </div>
-            <div class="card">
-                <div class="card-title">Market Prices</div>
-                <div id="prices"></div>
+
+            <!-- Strategies -->
+            <div class="section-title">Strategies</div>
+            <div id="strategies"></div>
+        </div>
+    </div>
+
+    <!-- Market Depth tab -->
+    <div id="tab-depth" class="tab-pane">
+        <div class="container">
+            <div class="depth-toolbar">
+                <select id="depth-exchange" class="depth-select" onchange="onExchangeChange()">
+                    <option value="OKX">OKX</option>
+                    <option value="WEBULL">Webull</option>
+                </select>
+                <div id="env-toggle" class="env-toggle">
+                    <button class="env-btn active" data-env="PAPER" onclick="setEnv('PAPER')">PAPER</button>
+                    <button class="env-btn" data-env="LIVE" onclick="setEnv('LIVE')">LIVE</button>
+                </div>
+                <select id="inst-type" class="depth-select" onchange="onInstTypeChange()">
+                    <option value="SWAP">Perpetual (SWAP)</option>
+                    <option value="SPOT">Spot</option>
+                    <option value="FUTURES">Futures</option>
+                </select>
+                <select id="region-select" class="depth-select" onchange="onRegionChange()" style="display:none">
+                    <option value="US">US Stocks/ETFs</option>
+                    <option value="HK">HK Stocks</option>
+                </select>
+                <div class="depth-search-wrap">
+                    <input id="depth-search" class="depth-search" type="text" placeholder="Search symbol..." autocomplete="off"
+                        oninput="onSearchInput()" onfocus="openSearchResults()" />
+                    <div id="search-results" class="depth-search-results"></div>
+                </div>
+                <span id="selected-symbol" class="selected-symbol">— no symbol selected —</span>
+                <span id="depth-status" class="depth-status">select a symbol to start</span>
+            </div>
+            <div id="depth-content">
+                <div class="depth-empty">Search and select a symbol above to view market depth</div>
             </div>
         </div>
-
-        <!-- Strategies -->
-        <div class="section-title">Strategies</div>
-        <div id="strategies"></div>
     </div>
 
     <script>
+        // ── Dashboard WebSocket ──────────────────────────────────────────────
         let ws;
         let lastData = {};
-        const signalHistory = {};  // strategy_name -> [signals]
+        const signalHistory = {};
 
         function connectWS() {
             const proto = location.protocol === 'https:' ? 'wss' : 'ws';
@@ -289,7 +501,6 @@
             }
 
             const html = Object.entries(strategies).map(([name, s]) => {
-                // Track signal history
                 if (s.last_signal && (!signalHistory[name] ||
                     signalHistory[name].length === 0 ||
                     signalHistory[name][signalHistory[name].length-1].timestamp !== s.last_signal.timestamp)) {
@@ -298,7 +509,6 @@
                     if (signalHistory[name].length > 50) signalHistory[name].shift();
                 }
 
-                const totalPnl = Object.values(s.positions || {}).reduce((sum, qty) => sum + qty, 0);
                 const posCount = Object.keys(s.positions || {}).filter(k => s.positions[k] !== 0).length;
 
                 return `<div class="strategy-card">
@@ -406,7 +616,6 @@
             </div>`;
         }
 
-        // Actions
         async function toggleStrategy(name, enabled) {
             const action = enabled ? 'enable' : 'disable';
             await fetch(`/api/strategy/${name}/${action}`, { method: 'POST' });
@@ -431,6 +640,282 @@
             if (s < 3600) return `${(s/60).toFixed(1)}m`;
             if (s < 86400) return `${(s/3600).toFixed(1)}h`;
             return `${(s/86400).toFixed(1)}d`;
+        }
+
+        // ── Tab navigation ───────────────────────────────────────────────────
+        function switchTab(name) {
+            document.querySelectorAll('.tab-pane').forEach(p => p.classList.remove('active'));
+            document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+            document.getElementById(`tab-${name}`).classList.add('active');
+            document.querySelectorAll('.tab-btn').forEach(b => {
+                if (b.getAttribute('onclick') === `switchTab('${name}')`) b.classList.add('active');
+            });
+            if (name === 'depth') {
+                if (allInstruments.length === 0) loadInstruments();
+                connectDepthWS();
+            }
+        }
+
+        // ── Market Depth ─────────────────────────────────────────────────────
+        let depthWS = null;
+        let allInstruments = [];
+        let currentSymbol = null;
+        let currentEnv = 'PAPER';
+        let currentExchange = 'OKX';
+        let currentRegion = 'US';
+        let searchDebounceTimer = null;
+
+        function isWebull() { return currentExchange === 'WEBULL'; }
+
+        function setEnv(env) {
+            if (isWebull()) return;   // Webull has no PAPER/LIVE distinction
+            currentEnv = env;
+            document.querySelectorAll('.env-btn').forEach(b => {
+                b.classList.toggle('active', b.dataset.env === env);
+            });
+            // Re-subscribe current symbol under new env
+            if (currentSymbol) selectSymbol(currentSymbol);
+        }
+
+        function updateExchangeUI() {
+            const webull = isWebull();
+            document.getElementById('inst-type').style.display = webull ? 'none' : '';
+            document.getElementById('region-select').style.display = webull ? '' : 'none';
+            // Disable env toggle for Webull (market data is always live)
+            const envToggle = document.getElementById('env-toggle');
+            envToggle.style.opacity = webull ? '0.4' : '1';
+            envToggle.style.pointerEvents = webull ? 'none' : 'auto';
+            if (webull) currentEnv = 'LIVE';
+            const search = document.getElementById('depth-search');
+            search.placeholder = webull
+                ? `Search ${currentRegion} stocks...`
+                : 'Search symbol...';
+        }
+
+        function onExchangeChange() {
+            currentExchange = document.getElementById('depth-exchange').value;
+            allInstruments = [];
+            document.getElementById('depth-search').value = '';
+            document.getElementById('search-results').innerHTML = '';
+            updateExchangeUI();
+            if (!isWebull()) loadInstruments();
+        }
+
+        function onRegionChange() {
+            currentRegion = document.getElementById('region-select').value;
+            allInstruments = [];
+            document.getElementById('depth-search').value = '';
+            document.getElementById('search-results').innerHTML = '';
+            document.getElementById('depth-search').placeholder = `Search ${currentRegion} stocks...`;
+        }
+
+        async function loadInstruments() {
+            if (isWebull()) return;   // Webull uses live keyword search instead
+            const instType  = document.getElementById('inst-type').value;
+            const exchange  = currentExchange;
+            const env       = currentEnv;
+            try {
+                const resp = await fetch(
+                    `/api/exchange/instruments?exchange=${exchange}&env=${env}&instType=${instType}`
+                );
+                allInstruments = await resp.json();
+                renderSearchResults(document.getElementById('depth-search').value.trim().toUpperCase());
+            } catch (e) {
+                allInstruments = [];
+            }
+        }
+
+        async function searchWebull(keyword) {
+            if (!keyword) {
+                allInstruments = [];
+                renderSearchResults('');
+                return;
+            }
+            try {
+                const resp = await fetch(
+                    `/api/exchange/instruments?exchange=WEBULL&keyword=${encodeURIComponent(keyword)}&region=${currentRegion}`
+                );
+                allInstruments = await resp.json();
+                renderSearchResults('');   // already filtered server-side
+            } catch (e) {
+                allInstruments = [];
+            }
+        }
+
+        function onInstTypeChange() {
+            allInstruments = [];
+            document.getElementById('depth-search').value = '';
+            document.getElementById('search-results').innerHTML = '';
+            loadInstruments();
+        }
+
+        function onSearchInput() {
+            const raw = document.getElementById('depth-search').value.trim();
+            openSearchResults();
+            if (isWebull()) {
+                // Debounced server-side search
+                clearTimeout(searchDebounceTimer);
+                searchDebounceTimer = setTimeout(() => searchWebull(raw), 250);
+            } else {
+                renderSearchResults(raw.toUpperCase());
+            }
+        }
+
+        function openSearchResults() {
+            if (!isWebull() && allInstruments.length === 0) loadInstruments();
+            document.getElementById('search-results').classList.add('open');
+        }
+
+        function closeSearchResults() {
+            document.getElementById('search-results').classList.remove('open');
+        }
+
+        function renderSearchResults(q) {
+            let filtered;
+            if (isWebull()) {
+                filtered = allInstruments.slice(0, 50);
+            } else {
+                filtered = q
+                    ? allInstruments.filter(i => i.instId.toUpperCase().includes(q)).slice(0, 50)
+                    : allInstruments.slice(0, 50);
+            }
+
+            const html = filtered.map(i => {
+                const sub = isWebull()
+                    ? `${i.name || ''} ${i.exchange ? '· ' + i.exchange : ''}`
+                    : `${i.baseCcy}/${i.quoteCcy}`;
+                return `<div class="search-item" onmousedown="selectSymbol('${i.instId}')">
+                    <span class="inst-id">${i.instId}</span>
+                    <span class="inst-sub">${sub}</span>
+                </div>`;
+            }).join('');
+            document.getElementById('search-results').innerHTML =
+                html || '<div class="search-item" style="color:#8b949e">No results</div>';
+        }
+
+        function selectSymbol(instId) {
+            currentSymbol = instId;
+            document.getElementById('depth-search').value = instId;
+            const envLabel = isWebull() ? currentRegion : currentEnv;
+            document.getElementById('selected-symbol').textContent =
+                `${currentExchange} · ${envLabel} · ${instId}`;
+            closeSearchResults();
+            document.getElementById('depth-content').innerHTML =
+                '<div class="depth-empty">Loading...</div>';
+            document.getElementById('depth-status').className = 'depth-status';
+            document.getElementById('depth-status').textContent = 'connecting...';
+            if (depthWS && depthWS.readyState === 1) {
+                depthWS.send(JSON.stringify({
+                    symbol:   instId,
+                    env:      currentEnv,
+                    exchange: currentExchange,
+                    region:   currentRegion,
+                }));
+            }
+        }
+
+        document.addEventListener('click', e => {
+            if (!e.target.closest('.depth-search-wrap')) closeSearchResults();
+        });
+
+        function connectDepthWS() {
+            if (depthWS && depthWS.readyState < 2) return;
+            const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+            depthWS = new WebSocket(`${proto}://${location.host}/ws/depth`);
+
+            depthWS.onopen = () => {
+                if (currentSymbol) {
+                    depthWS.send(JSON.stringify({
+                        symbol:   currentSymbol,
+                        env:      currentEnv,
+                        exchange: currentExchange,
+                        region:   currentRegion,
+                    }));
+                }
+            };
+
+            depthWS.onclose = () => {
+                if (document.getElementById('tab-depth').classList.contains('active')) {
+                    setTimeout(connectDepthWS, 3000);
+                }
+            };
+
+            depthWS.onmessage = (event) => renderDepth(JSON.parse(event.data));
+        }
+
+        function fmtPrice(p) {
+            const n = parseFloat(p);
+            return n >= 1000
+                ? n.toLocaleString('en', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+                : n.toPrecision(6);
+        }
+
+        function fmtSize(s) { return parseFloat(s).toFixed(4); }
+
+        function renderDepth(data) {
+            const bids = data.bids || [];
+            const asks = data.asks || [];
+
+            if (bids.length === 0 && asks.length === 0) {
+                document.getElementById('depth-content').innerHTML =
+                    '<div class="depth-empty">No depth data yet — waiting for first snapshot...</div>';
+                return;
+            }
+
+            const maxBidSz = Math.max(...bids.map(r => parseFloat(r[1])), 0.0001);
+            const maxAskSz = Math.max(...asks.map(r => parseFloat(r[1])), 0.0001);
+
+            const bidRows = bids.map(([p, s]) => {
+                const pct = (parseFloat(s) / maxBidSz * 100).toFixed(1);
+                return `<tr>
+                    <td class="bid-price">${fmtPrice(p)}</td>
+                    <td class="depth-bar-cell" style="position:relative">
+                        <div class="depth-bar bid-bar" style="width:${pct}%"></div>
+                        ${fmtSize(s)}
+                    </td>
+                </tr>`;
+            }).join('');
+
+            const askRows = asks.map(([p, s]) => {
+                const pct = (parseFloat(s) / maxAskSz * 100).toFixed(1);
+                return `<tr>
+                    <td class="ask-price">${fmtPrice(p)}</td>
+                    <td class="depth-bar-cell" style="position:relative">
+                        <div class="depth-bar ask-bar" style="width:${pct}%"></div>
+                        ${fmtSize(s)}
+                    </td>
+                </tr>`;
+            }).join('');
+
+            const spread = (bids.length && asks.length)
+                ? (parseFloat(asks[0][0]) - parseFloat(bids[0][0])).toFixed(4)
+                : '—';
+            const ts = data.timestamp
+                ? new Date(data.timestamp * 1000).toLocaleTimeString()
+                : '';
+
+            document.getElementById('depth-status').className = 'depth-status live';
+            const levelTag = data.level ? ` · ${data.level}` : '';
+            document.getElementById('depth-status').textContent = `● live${levelTag}  ${ts}`;
+
+            document.getElementById('depth-content').innerHTML = `
+                <div class="depth-grid">
+                    <div class="card">
+                        <div class="card-title">Bids</div>
+                        <table class="depth-table">
+                            <thead><tr><th>Price</th><th>Size</th></tr></thead>
+                            <tbody>${bidRows}</tbody>
+                        </table>
+                    </div>
+                    <div class="card">
+                        <div class="card-title">Asks</div>
+                        <table class="depth-table">
+                            <thead><tr><th>Price</th><th>Size</th></tr></thead>
+                            <tbody>${askRows}</tbody>
+                        </table>
+                    </div>
+                </div>
+                <div class="spread-row">Spread: ${spread}</div>`;
         }
 
         // Start

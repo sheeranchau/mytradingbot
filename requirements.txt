@@ -5,8 +5,11 @@ aiohttp>=3.9
 pyyaml>=6.0
 futu-api>=9.0
 fastapi>=0.100
-uvicorn>=0.20
+uvicorn[standard]>=0.20
 python-telegram-bot>=20.0
+paho-mqtt>=1.6
+webull>=0.6
+pyotp>=2.9
 
 # Test dependencies
 pytest>=8.0

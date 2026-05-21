@@ -30,10 +30,13 @@ class ProcessBase(ABC):
         await self.redis.connect()
         self.logger.info("Process started (pid=%d)", self.pid)
 
-        # Register signal handlers
+        # Register signal handlers (add_signal_handler is Unix-only)
         loop = asyncio.get_event_loop()
-        for sig in (signal.SIGINT, signal.SIGTERM):
-            loop.add_signal_handler(sig, lambda: asyncio.create_task(self.stop()))
+        try:
+            for sig in (signal.SIGINT, signal.SIGTERM):
+                loop.add_signal_handler(sig, lambda: asyncio.create_task(self.stop()))
+        except NotImplementedError:
+            pass  # Windows — KeyboardInterrupt will still trigger shutdown
 
         # Run heartbeat and main logic concurrently
         await asyncio.gather(

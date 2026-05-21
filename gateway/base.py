@@ -5,7 +5,7 @@ from abc import ABC, abstractmethod
 from dataclasses import asdict
 
 from core.process_base import ProcessBase
-from core.zmq_channels import Publisher, Puller, MARKET_DATA_PORT, ORDER_PORT
+from core.zmq_channels import Publisher, Puller, GATEWAY_PORTS
 from core.events import EventType
 from core.logger import get_logger
 
@@ -27,8 +27,17 @@ class BaseGateway(ProcessBase, ABC):
         self._order_puller = None
 
     async def run(self) -> None:
-        self._market_pub = Publisher(MARKET_DATA_PORT)
-        self._order_puller = Puller(ORDER_PORT, bind=False)
+        if self.gateway_name not in GATEWAY_PORTS:
+            raise ValueError(
+                f"Gateway '{self.gateway_name}' not registered in GATEWAY_PORTS "
+                f"(core/zmq_channels.py). Known: {list(GATEWAY_PORTS)}"
+            )
+        ports = GATEWAY_PORTS[self.gateway_name]
+        self._market_pub = Publisher(ports["market_data"])
+        # Each gateway binds its own orders port; risk engine connects per-gateway.
+        self._order_puller = Puller(ports["orders"], bind=True)
+        self.logger.info("ZMQ ports: market_data=%d, orders=%d",
+                         ports["market_data"], ports["orders"])
 
         await self.connect_exchange()
 
@@ -38,17 +47,17 @@ class BaseGateway(ProcessBase, ABC):
         )
 
     async def _listen_orders(self) -> None:
-        """Pull orders from risk engine and execute."""
+        """Pull orders from risk engine and execute. Each gateway has its own
+        order port, so no gateway-name filtering is required."""
         import asyncio
         while self.running:
             try:
                 order_data = await self._order_puller.pull()
-                if order_data.get("gateway") == self.gateway_name:
-                    event_type = order_data.get("event_type")
-                    if event_type == EventType.ORDER_NEW:
-                        await self.send_order(order_data)
-                    elif event_type == EventType.ORDER_CANCEL:
-                        await self.cancel_order(order_data.get("order_id", ""))
+                event_type = order_data.get("event_type")
+                if event_type == EventType.ORDER_NEW:
+                    await self.send_order(order_data)
+                elif event_type == EventType.ORDER_CANCEL:
+                    await self.cancel_order(order_data.get("order_id", ""))
             except Exception as e:
                 self.logger.error("Order listener error: %s", e)
                 await asyncio.sleep(1)

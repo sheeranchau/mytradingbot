@@ -26,6 +26,7 @@ LOG_DIR = Path(__file__).parent / "logs"
 PROCESS_REGISTRY = {
     "gateway_okx": "gateway.okx_runner",
     "gateway_futu": "gateway.futu_runner",
+    "gateway_webull": "gateway.webull_runner",
     "strategy_container": "strategy.runner",
     "risk_engine": "risk.runner",
     "view_telegram": "view.telegram_runner",
@@ -37,6 +38,7 @@ STARTUP_ORDER = [
     "risk_engine",
     "gateway_okx",
     "gateway_futu",
+    "gateway_webull",
     "strategy_container",
     "view_telegram",
     "view_web",

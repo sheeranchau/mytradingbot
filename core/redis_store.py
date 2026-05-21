@@ -29,11 +29,18 @@ class RedisStore:
             raise RuntimeError("RedisStore not connected")
         return self._client
 
+    async def _hmset(self, key: str, mapping: dict) -> None:
+        """Pipeline individual HSET calls — compatible with Redis 3.2+."""
+        pipe = self.client.pipeline()
+        for field, value in mapping.items():
+            pipe.hset(key, field, value)
+        await pipe.execute()
+
     # --- Position state ---
     async def set_position(self, gateway: str, symbol: str, strategy: str,
                            position: dict) -> None:
         key = f"position:{gateway}:{symbol}:{strategy}"
-        await self.client.hset(key, mapping=position)
+        await self._hmset(key, position)
 
     async def get_position(self, gateway: str, symbol: str, strategy: str) -> dict:
         key = f"position:{gateway}:{symbol}:{strategy}"
@@ -59,7 +66,7 @@ class RedisStore:
     # --- Risk config ---
     async def set_risk_limits(self, strategy: str, limits: dict) -> None:
         key = f"risk_limits:{strategy}"
-        await self.client.hset(key, mapping={
+        await self._hmset(key, {
             k: json.dumps(v) if not isinstance(v, str) else v
             for k, v in limits.items()
         })
@@ -90,7 +97,7 @@ class RedisStore:
     # --- Heartbeat tracking ---
     async def set_heartbeat(self, process_name: str, info: dict) -> None:
         key = f"heartbeat:{process_name}"
-        await self.client.hset(key, mapping=info)
+        await self._hmset(key, info)
         await self.client.expire(key, 30)  # expires if no heartbeat for 30s
 
     async def get_all_heartbeats(self) -> dict[str, dict]:

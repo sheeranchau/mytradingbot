@@ -8,7 +8,8 @@ import time
 
 from core.process_base import ProcessBase
 from core.zmq_channels import (
-    Subscriber, Pusher, MARKET_DATA_PORT, SIGNAL_PORT, RISK_KILL_PORT
+    Subscriber, MultiSubscriber, Pusher,
+    SIGNAL_PORT, RISK_KILL_PORT, GATEWAY_MARKET_DATA_PORTS,
 )
 from core.events import EventType
 from core.logger import get_logger
@@ -39,7 +40,8 @@ class StrategyContainer(ProcessBase):
                 self._routes.setdefault(key, []).append(s.name)
 
     async def run(self) -> None:
-        market_sub = Subscriber(MARKET_DATA_PORT, topics=["tick.", "orderbook.", "fill."])
+        market_sub = MultiSubscriber(GATEWAY_MARKET_DATA_PORTS,
+                                     topics=["tick.", "orderbook.", "fill."])
         signal_push = Pusher(SIGNAL_PORT, bind=False)
         kill_sub = Subscriber(RISK_KILL_PORT, topics=["risk."])
 

@@ -31,6 +31,19 @@ gateways:
       - "US.AAPL"
       - "US.TSLA"
 
+  webull:
+    email:          "${WEBULL_EMAIL}"
+    password:       "${WEBULL_PASSWORD}"
+    trade_pin:      "${WEBULL_TRADE_PIN}"        # 6-digit trading PIN
+    mfa_seed:       "${WEBULL_MFA_SEED}"         # TOTP seed for unattended MFA (optional)
+    device_id:      "${WEBULL_DID}"              # 32-char hex device id (optional; auto-generated otherwise)
+    region:         "US"                         # US or HK
+    paper:          true                         # <-- true = paper account, false = REAL MONEY
+    extended_hours: true                         # include pre/post-market sessions on orders
+    symbols:
+      - "AAPL"
+      - "TSLA"
+
 # Strategies
 strategies:
   example_momentum:

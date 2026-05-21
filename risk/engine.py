@@ -9,8 +9,9 @@ from dataclasses import dataclass
 
 from core.process_base import ProcessBase
 from core.zmq_channels import (
-    Puller, Pusher, Publisher, Subscriber,
-    SIGNAL_PORT, ORDER_PORT, RISK_KILL_PORT, MARKET_DATA_PORT
+    Puller, Pusher, Publisher, MultiSubscriber,
+    SIGNAL_PORT, RISK_KILL_PORT,
+    GATEWAY_ORDER_PORTS, GATEWAY_MARKET_DATA_PORTS,
 )
 from core.events import EventType
 from core.logger import get_logger
@@ -48,12 +49,15 @@ class RiskEngine(ProcessBase):
     async def run(self) -> None:
         # Pull signals from strategies
         signal_puller = Puller(SIGNAL_PORT, bind=True)
-        # Push validated orders to gateways
-        order_pusher = Pusher(ORDER_PORT, bind=True)
+        # One Pusher per gateway — each gateway binds its own orders port.
+        order_pushers: dict[str, Pusher] = {
+            gw: Pusher(port, bind=False) for gw, port in GATEWAY_ORDER_PORTS.items()
+        }
+        self.logger.info("Order routers ready for gateways: %s", list(order_pushers))
         # Publish kill signals
         kill_pub = Publisher(RISK_KILL_PORT)
-        # Subscribe to fills for PnL tracking
-        market_sub = Subscriber(MARKET_DATA_PORT, topics=["fill.", "tick."])
+        # Subscribe to fills/ticks from every gateway
+        market_sub = MultiSubscriber(GATEWAY_MARKET_DATA_PORTS, topics=["fill.", "tick."])
 
         asyncio.create_task(self._monitor_market(market_sub, kill_pub))
 
@@ -62,11 +66,16 @@ class RiskEngine(ProcessBase):
                 signal = await signal_puller.pull()
                 approved = await self._check_signal(signal, kill_pub)
                 if approved:
+                    gw = signal["gateway"]
+                    pusher = order_pushers.get(gw)
+                    if not pusher:
+                        self.logger.error("Signal for unknown gateway '%s' — dropped", gw)
+                        continue
                     # Convert signal to order
                     order = {
                         "event_type": EventType.ORDER_NEW,
                         "strategy": signal["strategy"],
-                        "gateway": signal["gateway"],
+                        "gateway": gw,
                         "symbol": signal["symbol"],
                         "side": signal["side"],
                         "order_type": signal.get("order_type", "limit"),
@@ -74,7 +83,7 @@ class RiskEngine(ProcessBase):
                         "quantity": signal.get("quantity", 0),
                         "timestamp": time.time(),
                     }
-                    await order_pusher.push(order)
+                    await pusher.push(order)
             except Exception as e:
                 self.logger.error("Signal processing error: %s", e)
                 await asyncio.sleep(0.1)
@@ -140,7 +149,7 @@ class RiskEngine(ProcessBase):
 
         return True
 
-    async def _monitor_market(self, market_sub: Subscriber, kill_pub: Publisher) -> None:
+    async def _monitor_market(self, market_sub: MultiSubscriber, kill_pub: Publisher) -> None:
         """Continuously update PnL and delta from market data and fills."""
         while self.running:
             try:

@@ -9,7 +9,9 @@ from typing import Optional
 import aiohttp
 
 from core.process_base import ProcessBase
-from core.zmq_channels import Subscriber, MARKET_DATA_PORT, RISK_KILL_PORT
+from core.zmq_channels import (
+    Subscriber, MultiSubscriber, RISK_KILL_PORT, GATEWAY_MARKET_DATA_PORTS,
+)
 from core.logger import get_logger
 
 
@@ -35,7 +37,7 @@ class TelegramReporter(ProcessBase):
         self._session = aiohttp.ClientSession()
 
         # Subscribe to relevant events
-        fill_sub = Subscriber(MARKET_DATA_PORT, topics=["fill."])
+        fill_sub = MultiSubscriber(GATEWAY_MARKET_DATA_PORTS, topics=["fill."])
         kill_sub = Subscriber(RISK_KILL_PORT, topics=["risk."])
 
         await asyncio.gather(
@@ -45,7 +47,7 @@ class TelegramReporter(ProcessBase):
             self._poll_commands(),
         )
 
-    async def _listen_fills(self, sub: Subscriber) -> None:
+    async def _listen_fills(self, sub) -> None:
         while self.running:
             try:
                 topic, data = await sub.receive()

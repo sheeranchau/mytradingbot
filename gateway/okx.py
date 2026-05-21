@@ -36,6 +36,8 @@ class OKXGateway(BaseGateway):
         self.passphrase = passphrase
         self.symbols = symbols
         self.simulated = simulated
+        # Local order book state per symbol for incremental update management
+        self._orderbooks: dict = {}
 
         # Select endpoints based on mode
         if simulated:
@@ -53,26 +55,34 @@ class OKXGateway(BaseGateway):
         self._ws_private: Optional[aiohttp.ClientWebSocketResponse] = None
         self._session: Optional[aiohttp.ClientSession] = None
 
+    def _has_credentials(self) -> bool:
+        # Treat unresolved YAML placeholders (e.g. "${OKX_API_KEY}") as missing
+        def _set(val):
+            return bool(val) and not str(val).startswith("${")
+        return _set(self.api_key) and _set(self.secret_key) and _set(self.passphrase)
+
     async def connect_exchange(self) -> None:
         headers = {}
         if self.simulated:
             headers["x-simulated-trading"] = "1"
         self._session = aiohttp.ClientSession(headers=headers)
 
-        # Connect public websocket
+        # Connect public websocket (no credentials required)
         self.logger.info("Connecting public WS: %s", self.WS_PUBLIC)
         self._ws_public = await self._session.ws_connect(self.WS_PUBLIC)
         self.logger.info("Public WS connected")
 
-        # Connect and authenticate private websocket
-        self.logger.info("Connecting private WS: %s", self.WS_PRIVATE)
-        self._ws_private = await self._session.ws_connect(self.WS_PRIVATE)
-        self.logger.info("Private WS connected, authenticating...")
-        await self._authenticate()
-        self.logger.info("Authentication successful")
+        if self._has_credentials():
+            # Connect and authenticate private websocket for order/fill streams
+            self.logger.info("Connecting private WS: %s", self.WS_PRIVATE)
+            self._ws_private = await self._session.ws_connect(self.WS_PRIVATE)
+            self.logger.info("Private WS connected, authenticating...")
+            await self._authenticate()
+            self.logger.info("Authentication successful")
+            await self._subscribe_private()
+        else:
+            self.logger.info("No API credentials — running in market-data-only mode")
 
-        # Subscribe to private channels (orders, positions)
-        await self._subscribe_private()
         self.logger.info("Subscribed to %d symbols: %s", len(self.symbols), self.symbols)
 
     async def _authenticate(self) -> None:
@@ -110,11 +120,12 @@ class OKXGateway(BaseGateway):
         args = []
         for symbol in self.symbols:
             args.append({"channel": "tickers", "instId": symbol})
-            args.append({"channel": "books5", "instId": symbol})
+            args.append({"channel": "books", "instId": symbol})
         await self._ws_public.send_json({"op": "subscribe", "args": args})
 
-        # Listen and publish
-        asyncio.create_task(self._listen_private())
+        # Listen and publish (private task only when credentials were provided)
+        if self._has_credentials():
+            asyncio.create_task(self._listen_private())
 
         while self.running:
             try:
@@ -131,10 +142,12 @@ class OKXGateway(BaseGateway):
     async def _handle_public_msg(self, data: dict) -> None:
         arg = data.get("arg", {})
         channel = arg.get("channel", "")
+        # "action" is top-level on the books channel (snapshot vs incremental update)
+        action = data.get("action", "snapshot")
+        symbol = arg.get("instId", "")
         records = data.get("data", [])
 
         for record in records:
-            symbol = arg.get("instId", "")
             if channel == "tickers":
                 await self.publish_tick(symbol, {
                     "bid": float(record.get("bidPx", 0)),
@@ -145,10 +158,33 @@ class OKXGateway(BaseGateway):
                     "last_size": float(record.get("lastSz", 0)),
                     "timestamp": time.time(),
                 })
-            elif channel == "books5":
+            elif channel == "books":
+                if symbol not in self._orderbooks:
+                    self._orderbooks[symbol] = {"bids": {}, "asks": {}}
+                book = self._orderbooks[symbol]
+
+                if action == "snapshot":
+                    book["bids"] = {float(e[0]): float(e[1]) for e in record.get("bids", [])}
+                    book["asks"] = {float(e[0]): float(e[1]) for e in record.get("asks", [])}
+                else:
+                    for e in record.get("bids", []):
+                        price, size = float(e[0]), float(e[1])
+                        if size == 0:
+                            book["bids"].pop(price, None)
+                        else:
+                            book["bids"][price] = size
+                    for e in record.get("asks", []):
+                        price, size = float(e[0]), float(e[1])
+                        if size == 0:
+                            book["asks"].pop(price, None)
+                        else:
+                            book["asks"][price] = size
+
+                top_bids = sorted(book["bids"].items(), reverse=True)[:10]
+                top_asks = sorted(book["asks"].items())[:10]
                 await self.publish_orderbook(symbol, {
-                    "bids": [[float(p), float(s)] for p, s, _, _ in record.get("bids", [])],
-                    "asks": [[float(p), float(s)] for p, s, _, _ in record.get("asks", [])],
+                    "bids": [[p, s] for p, s in top_bids],
+                    "asks": [[p, s] for p, s in top_asks],
                     "timestamp": time.time(),
                 })
 
