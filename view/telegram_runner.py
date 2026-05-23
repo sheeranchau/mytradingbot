@@ -10,10 +10,12 @@ def main():
     config = load_settings()
 
     tg_cfg = config["view"]["telegram"]
+    redis_url = config.get("redis", {}).get("url", "redis://127.0.0.1:6379")
     reporter = TelegramReporter(
         bot_token=os.environ.get("TELEGRAM_BOT_TOKEN", tg_cfg.get("bot_token", "")),
         chat_id=os.environ.get("TELEGRAM_CHAT_ID", tg_cfg.get("chat_id", "")),
         summary_interval=tg_cfg.get("summary_interval", 300),
+        redis_url=redis_url,
     )
     asyncio.run(reporter.start())
 

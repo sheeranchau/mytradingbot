@@ -1,14 +1,17 @@
 """Entry point for web dashboard process."""
-import asyncio
+import os
 import sys
 import uvicorn
-from core.config import load_env
+from core.config import load_env, load_settings
 
 load_env()
 
 
 def main():
-    # ZMQ requires a selector event loop on Windows (Proactor is the default in 3.8+)
+    config = load_settings()
+    redis_url = config.get("redis", {}).get("url", "redis://127.0.0.1:6379")
+    os.environ.setdefault("REDIS_URL", redis_url)
+
     loop = "asyncio" if sys.platform == "win32" else "auto"
     uvicorn.run(
         "view.web.app:app",

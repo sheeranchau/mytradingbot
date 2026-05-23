@@ -64,6 +64,20 @@ class RiskEngine(ProcessBase):
         while self.running:
             try:
                 signal = await signal_puller.pull()
+                event_type = signal.get("event_type", EventType.SIGNAL)
+
+                # Cancel and amend bypass risk checks
+                if event_type in (EventType.ORDER_CANCEL, EventType.ORDER_AMEND):
+                    gw = signal.get("gateway", "")
+                    pusher = order_pushers.get(gw)
+                    if not pusher:
+                        self.logger.error("%s for unknown gateway '%s' — dropped", event_type, gw)
+                        continue
+                    await pusher.push(signal)
+                    self.logger.info("Forwarded %s for order %s to %s",
+                                     event_type, signal.get("order_id", "?"), gw)
+                    continue
+
                 approved = await self._check_signal(signal, kill_pub)
                 if approved:
                     gw = signal["gateway"]

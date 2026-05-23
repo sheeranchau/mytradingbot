@@ -331,8 +331,10 @@
         }
         .depth-table td:first-child { text-align: left; }
         .depth-table tr:last-child td { border-bottom: none; }
-        .bid-price { color: #2dd4bf; }
-        .ask-price { color: #f87171; }
+        .bid-price { color: #2dd4bf; cursor: pointer; }
+        .bid-price:hover { text-decoration: underline; }
+        .ask-price { color: #f87171; cursor: pointer; }
+        .ask-price:hover { text-decoration: underline; }
         .depth-bar-cell { position: relative; }
         .depth-bar {
             position: absolute;
@@ -356,17 +358,130 @@
             border-radius: 4px;
             margin: 8px 0;
         }
+
+        /* Order form */
+        .order-section {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 16px;
+            margin-bottom: 16px;
+        }
+        .order-form { display: flex; flex-direction: column; gap: 12px; }
+        .order-form .form-row {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        .order-form label {
+            width: 80px;
+            font-size: 12px;
+            color: #8b949e;
+            text-transform: uppercase;
+            letter-spacing: 0.3px;
+            flex-shrink: 0;
+        }
+        .order-form input, .order-form select {
+            flex: 1;
+            background: #0d1117;
+            border: 1px solid #30363d;
+            color: #e1e4e8;
+            padding: 8px 12px;
+            border-radius: 6px;
+            font-family: inherit;
+            font-size: 13px;
+        }
+        .order-form input:focus, .order-form select:focus {
+            outline: none;
+            border-color: #58a6ff;
+        }
+        .side-toggle {
+            display: flex;
+            border: 1px solid #30363d;
+            border-radius: 6px;
+            overflow: hidden;
+            flex: 1;
+        }
+        .side-btn {
+            flex: 1;
+            padding: 8px 0;
+            border: none;
+            background: #0d1117;
+            color: #8b949e;
+            cursor: pointer;
+            font-family: inherit;
+            font-size: 13px;
+            font-weight: 600;
+        }
+        .side-btn + .side-btn { border-left: 1px solid #30363d; }
+        .side-btn.active-buy { background: #1b4332; color: #2dd4bf; }
+        .side-btn.active-sell { background: #3d1a1a; color: #f87171; }
+        .btn-buy {
+            background: #1b4332; border-color: #2dd4bf44; color: #2dd4bf;
+            padding: 10px 24px; font-size: 14px; font-weight: 600;
+        }
+        .btn-buy:hover { background: #245a43; }
+        .btn-sell {
+            background: #3d1a1a; border-color: #f8717144; color: #f87171;
+            padding: 10px 24px; font-size: 14px; font-weight: 600;
+        }
+        .btn-sell:hover { background: #5a2a2a; }
+        .order-result {
+            margin-top: 8px;
+            padding: 8px 12px;
+            border-radius: 6px;
+            font-size: 12px;
+            display: none;
+        }
+        .order-result.success { display: block; background: #1b4332; color: #2dd4bf; border: 1px solid #2dd4bf44; }
+        .order-result.error { display: block; background: #3d1a1a; color: #f87171; border: 1px solid #f8717144; }
+
+        /* Order history */
+        .order-history {
+            max-height: 300px;
+            overflow-y: auto;
+        }
+        .order-history-row {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 8px 0;
+            border-bottom: 1px solid #21262d;
+            font-size: 12px;
+        }
+        .order-history-row:last-child { border-bottom: none; }
+        .btn-xs {
+            padding: 2px 8px;
+            font-size: 11px;
+            border-radius: 4px;
+        }
+        .btn-danger { background: #3d1a1a; border-color: #f8717144; color: #f87171; }
+        .btn-danger:hover { background: #5a2a2a; }
+        .btn-warn { background: #3d2e1a; border-color: #f5a62344; color: #f5a623; }
+        .btn-warn:hover { background: #5a441a; }
+        .pending-row {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 8px 0;
+            border-bottom: 1px solid #21262d;
+            font-size: 12px;
+        }
+        .pending-row:last-child { border-bottom: none; }
     </style>
 </head>
 <body>
     <div class="header">
         <h1>Trading Dashboard</h1>
-        <span id="ws-status" class="ws-status ws-disconnected">disconnected</span>
+        <div style="display:flex; align-items:center; gap:12px;">
+            <span id="ws-status" class="ws-status ws-disconnected">disconnected</span>
+            <button class="btn" onclick="logout()" style="font-size:11px;">Logout</button>
+        </div>
     </div>
 
     <div class="tabs">
         <button class="tab-btn active" onclick="switchTab('dashboard')">Dashboard</button>
-        <button class="tab-btn" onclick="switchTab('depth')">Market Depth</button>
+        <button class="tab-btn" onclick="switchTab('depth')">Market</button>
+        <button class="tab-btn" onclick="switchTab('settings')">Settings</button>
     </div>
 
     <!-- Dashboard tab -->
@@ -390,10 +505,11 @@
         </div>
     </div>
 
-    <!-- Market Depth tab -->
+    <!-- Market tab -->
     <div id="tab-depth" class="tab-pane">
         <div class="container">
-            <div class="depth-toolbar">
+            <!-- Shared symbol toolbar -->
+            <div class="depth-toolbar" style="margin-bottom: 16px;">
                 <select id="depth-exchange" class="depth-select" onchange="onExchangeChange()">
                     <option value="OKX">OKX</option>
                     <option value="WEBULL">Webull</option>
@@ -419,13 +535,157 @@
                 <span id="selected-symbol" class="selected-symbol">— no symbol selected —</span>
                 <span id="depth-status" class="depth-status">select a symbol to start</span>
             </div>
-            <div id="depth-content">
-                <div class="depth-empty">Search and select a symbol above to view market depth</div>
+
+            <!-- Order + Depth side by side -->
+            <div class="order-section">
+                <!-- Left: Order form + pending + history -->
+                <div>
+                    <div class="card" style="margin-bottom: 16px;">
+                        <div class="card-title">Place Order</div>
+                        <div class="order-form" id="order-form">
+                            <div class="form-row">
+                                <label>Symbol</label>
+                                <input type="text" id="order-symbol" readonly
+                                    style="color:#58a6ff; cursor:default; background:#0d1117;"
+                                    placeholder="Select a symbol above" />
+                                <input type="hidden" id="order-gateway" />
+                            </div>
+                            <div class="form-row">
+                                <label>Side</label>
+                                <div class="side-toggle">
+                                    <button class="side-btn active-buy" id="side-buy" onclick="setOrderSide('buy')">BUY</button>
+                                    <button class="side-btn" id="side-sell" onclick="setOrderSide('sell')">SELL</button>
+                                </div>
+                            </div>
+                            <div class="form-row">
+                                <label>Type</label>
+                                <select id="order-type" onchange="togglePriceField()">
+                                    <option value="limit">Limit</option>
+                                    <option value="market">Market</option>
+                                </select>
+                            </div>
+                            <div class="form-row" id="price-row">
+                                <label>Price</label>
+                                <input type="number" id="order-price" placeholder="0.00" step="any" />
+                            </div>
+                            <div class="form-row">
+                                <label>Quantity</label>
+                                <input type="number" id="order-quantity" value="1" step="any" min="0" />
+                            </div>
+                            <div class="form-row" style="justify-content: flex-end; gap: 8px;">
+                                <button class="btn btn-buy" id="btn-submit-order" onclick="submitOrder()">Submit BUY</button>
+                            </div>
+                            <div class="order-result" id="order-result"></div>
+                        </div>
+                    </div>
+                    <div class="card" style="margin-bottom: 16px">
+                        <div class="card-title" style="display: flex; justify-content: space-between; align-items: center;">
+                            Active Orders
+                            <button class="btn" onclick="loadPendingOrders()" style="font-size:11px; padding:3px 8px;">Refresh</button>
+                        </div>
+                        <div class="order-history" id="pending-orders">
+                            <div style="color: #8b949e">No active orders</div>
+                        </div>
+                    </div>
+                    <div class="card">
+                        <div class="card-title">Finished Orders</div>
+                        <div class="order-history" id="order-history">
+                            <div style="color: #8b949e">No finished orders</div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Right: Market Depth -->
+                <div>
+                    <div id="depth-content" class="card" style="min-height: 300px;">
+                        <div class="card-title">Market Depth</div>
+                        <div class="depth-empty">Select a symbol above to view market depth</div>
+                    </div>
+                </div>
             </div>
         </div>
     </div>
 
+    <!-- Settings tab -->
+    <div id="tab-settings" class="tab-pane">
+        <div class="container">
+            <div class="grid grid-2" style="margin-bottom:16px;">
+                <div class="card">
+                    <div class="card-title">Change Password</div>
+                    <div class="order-form">
+                        <div class="form-row">
+                            <label style="width:120px;">Current</label>
+                            <input type="password" id="pw-current" placeholder="Current password" />
+                        </div>
+                        <div class="form-row">
+                            <label style="width:120px;">New</label>
+                            <input type="password" id="pw-new" placeholder="Min 8 characters" />
+                        </div>
+                        <div class="form-row">
+                            <label style="width:120px;">Confirm</label>
+                            <input type="password" id="pw-confirm" placeholder="Confirm new password" />
+                        </div>
+                        <div class="form-row" style="justify-content:flex-end;">
+                            <button class="btn btn-primary" onclick="changePassword()">Update Password</button>
+                        </div>
+                        <div class="order-result" id="pw-result"></div>
+                    </div>
+                </div>
+                <div class="card">
+                    <div class="card-title">Two-Factor Authentication</div>
+                    <div id="2fa-status" style="margin-bottom:12px; color:#8b949e;">Loading...</div>
+                    <div id="2fa-setup" class="order-form"></div>
+                    <div class="order-result" id="2fa-result"></div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Amend modal -->
+    <div id="amend-modal" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,0.6); z-index:200; display:none; align-items:center; justify-content:center;">
+        <div class="card" style="width:380px; margin:auto; margin-top:20vh;">
+            <div class="card-title">Amend Order</div>
+            <div style="margin-bottom:8px; font-size:12px; color:#8b949e;">
+                Order: <span id="amend-order-id" style="color:#e1e4e8;"></span>
+            </div>
+            <div style="margin-bottom:8px; font-size:12px; color:#8b949e;">
+                Symbol: <span id="amend-symbol" style="color:#e1e4e8;"></span>
+            </div>
+            <div style="display:flex; gap:10px; margin-bottom:12px;">
+                <div style="flex:1;">
+                    <div style="font-size:11px; color:#8b949e; margin-bottom:4px;">New Price</div>
+                    <input type="number" id="amend-price" step="any" style="width:100%; background:#0d1117; border:1px solid #30363d; color:#e1e4e8; padding:8px; border-radius:6px; font-family:inherit; font-size:13px;" />
+                </div>
+                <div style="flex:1;">
+                    <div style="font-size:11px; color:#8b949e; margin-bottom:4px;">New Quantity</div>
+                    <input type="number" id="amend-quantity" step="any" style="width:100%; background:#0d1117; border:1px solid #30363d; color:#e1e4e8; padding:8px; border-radius:6px; font-family:inherit; font-size:13px;" />
+                </div>
+            </div>
+            <input type="hidden" id="amend-gateway" />
+            <div style="display:flex; gap:8px; justify-content:flex-end;">
+                <button class="btn" onclick="closeAmendModal()">Cancel</button>
+                <button class="btn btn-primary" onclick="submitAmend()">Amend</button>
+            </div>
+            <div class="order-result" id="amend-result" style="margin-top:8px;"></div>
+        </div>
+    </div>
+
     <script>
+        // ── Auth helpers ─────────────────────────────────────────────────────
+        const _origFetch = window.fetch;
+        window.fetch = async function(...args) {
+            const resp = await _origFetch(...args);
+            if (resp.status === 401) {
+                window.location.href = '/login';
+            }
+            return resp;
+        };
+
+        async function logout() {
+            await _origFetch('/auth/logout', { method: 'POST' });
+            window.location.href = '/login';
+        }
+
         // ── Dashboard WebSocket ──────────────────────────────────────────────
         let ws;
         let lastData = {};
@@ -440,9 +700,10 @@
                 document.getElementById('ws-status').textContent = 'live';
             };
 
-            ws.onclose = () => {
+            ws.onclose = (ev) => {
                 document.getElementById('ws-status').className = 'ws-status ws-disconnected';
                 document.getElementById('ws-status').textContent = 'disconnected';
+                if (ev.code === 4001) { window.location.href = '/login'; return; }
                 setTimeout(connectWS, 3000);
             };
 
@@ -654,9 +915,13 @@
                 if (allInstruments.length === 0) loadInstruments();
                 connectDepthWS();
             }
+            if (name === 'settings') {
+                load2FAStatus();
+            }
         }
 
         // ── Market Depth ─────────────────────────────────────────────────────
+        const exchangeToGateway = { OKX: 'okx', WEBULL: 'webull', FUTU: 'futu' };
         let depthWS = null;
         let allInstruments = [];
         let currentSymbol = null;
@@ -694,11 +959,16 @@
 
         function onExchangeChange() {
             currentExchange = document.getElementById('depth-exchange').value;
+            currentSymbol = null;
             allInstruments = [];
             document.getElementById('depth-search').value = '';
             document.getElementById('search-results').innerHTML = '';
+            document.getElementById('selected-symbol').textContent = '— no symbol selected —';
+            document.getElementById('order-symbol').value = '';
+            document.getElementById('order-gateway').value = exchangeToGateway[currentExchange] || 'okx';
             updateExchangeUI();
             if (!isWebull()) loadInstruments();
+            loadPendingOrders();
         }
 
         function onRegionChange() {
@@ -801,9 +1071,16 @@
                 `${currentExchange} · ${envLabel} · ${instId}`;
             closeSearchResults();
             document.getElementById('depth-content').innerHTML =
-                '<div class="depth-empty">Loading...</div>';
+                '<div class="card-title">Market Depth</div><div class="depth-empty">Loading...</div>';
             document.getElementById('depth-status').className = 'depth-status';
             document.getElementById('depth-status').textContent = 'connecting...';
+
+            // Sync order form
+            const gw = exchangeToGateway[currentExchange] || 'okx';
+            document.getElementById('order-gateway').value = gw;
+            document.getElementById('order-symbol').value = instId;
+            loadPendingOrders();
+
             if (depthWS && depthWS.readyState === 1) {
                 depthWS.send(JSON.stringify({
                     symbol:   instId,
@@ -834,7 +1111,8 @@
                 }
             };
 
-            depthWS.onclose = () => {
+            depthWS.onclose = (ev) => {
+                if (ev.code === 4001) { window.location.href = '/login'; return; }
                 if (document.getElementById('tab-depth').classList.contains('active')) {
                     setTimeout(connectDepthWS, 3000);
                 }
@@ -868,7 +1146,7 @@
             const bidRows = bids.map(([p, s]) => {
                 const pct = (parseFloat(s) / maxBidSz * 100).toFixed(1);
                 return `<tr>
-                    <td class="bid-price">${fmtPrice(p)}</td>
+                    <td class="bid-price" onclick="fillOrderPrice(${parseFloat(p)},'buy')" title="Click to buy at this price">${fmtPrice(p)}</td>
                     <td class="depth-bar-cell" style="position:relative">
                         <div class="depth-bar bid-bar" style="width:${pct}%"></div>
                         ${fmtSize(s)}
@@ -879,7 +1157,7 @@
             const askRows = asks.map(([p, s]) => {
                 const pct = (parseFloat(s) / maxAskSz * 100).toFixed(1);
                 return `<tr>
-                    <td class="ask-price">${fmtPrice(p)}</td>
+                    <td class="ask-price" onclick="fillOrderPrice(${parseFloat(p)},'sell')" title="Click to sell at this price">${fmtPrice(p)}</td>
                     <td class="depth-bar-cell" style="position:relative">
                         <div class="depth-bar ask-bar" style="width:${pct}%"></div>
                         ${fmtSize(s)}
@@ -916,6 +1194,361 @@
                     </div>
                 </div>
                 <div class="spread-row">Spread: ${spread}</div>`;
+        }
+
+        // ── Manual Order ─────────────────────────────────────────────────
+        function fillOrderPrice(price, side) {
+            document.getElementById('order-price').value = price;
+            document.getElementById('order-type').value = 'limit';
+            document.getElementById('price-row').style.display = 'flex';
+            setOrderSide(side);
+        }
+
+        let orderSide = 'buy';
+
+        function setOrderSide(side) {
+            orderSide = side;
+            const buyBtn = document.getElementById('side-buy');
+            const sellBtn = document.getElementById('side-sell');
+            buyBtn.className = side === 'buy' ? 'side-btn active-buy' : 'side-btn';
+            sellBtn.className = side === 'sell' ? 'side-btn active-sell' : 'side-btn';
+            const submitBtn = document.getElementById('btn-submit-order');
+            submitBtn.textContent = side === 'buy' ? 'Submit BUY' : 'Submit SELL';
+            submitBtn.className = side === 'buy' ? 'btn btn-buy' : 'btn btn-sell';
+        }
+
+        function togglePriceField() {
+            const type = document.getElementById('order-type').value;
+            document.getElementById('price-row').style.display = type === 'limit' ? 'flex' : 'none';
+        }
+
+        async function submitOrder() {
+            const gateway = document.getElementById('order-gateway').value;
+            const symbol = document.getElementById('order-symbol').value.trim();
+            const orderType = document.getElementById('order-type').value;
+            const price = parseFloat(document.getElementById('order-price').value) || 0;
+            const quantity = parseFloat(document.getElementById('order-quantity').value) || 0;
+            const resultEl = document.getElementById('order-result');
+
+            if (!symbol || !currentSymbol) {
+                resultEl.className = 'order-result error';
+                resultEl.textContent = 'Select a symbol from the toolbar above';
+                return;
+            }
+            if (quantity <= 0) {
+                resultEl.className = 'order-result error';
+                resultEl.textContent = 'Quantity must be > 0';
+                return;
+            }
+            if (orderType === 'limit' && price <= 0) {
+                resultEl.className = 'order-result error';
+                resultEl.textContent = 'Price is required for limit orders';
+                return;
+            }
+
+            try {
+                const resp = await fetch('/api/order', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        gateway, symbol, side: orderSide,
+                        order_type: orderType, price, quantity,
+                    }),
+                });
+                const data = await resp.json();
+                if (resp.ok) {
+                    resultEl.className = 'order-result success';
+                    resultEl.textContent = data.message;
+                    loadOrderHistory();
+                    setTimeout(loadPendingOrders, 2000);
+                } else {
+                    resultEl.className = 'order-result error';
+                    resultEl.textContent = data.detail || 'Order failed';
+                }
+            } catch (e) {
+                resultEl.className = 'order-result error';
+                resultEl.textContent = 'Network error: ' + e.message;
+            }
+            setTimeout(() => { resultEl.className = 'order-result'; }, 5000);
+        }
+
+        async function loadOrderHistory() {
+            try {
+                const resp = await fetch('/api/order/history?count=50');
+                const orders = await resp.json();
+                const el = document.getElementById('order-history');
+                if (orders.length === 0) {
+                    el.innerHTML = '<div style="color: #8b949e">No finished orders</div>';
+                    return;
+                }
+                el.innerHTML = orders.slice().reverse().map(o => {
+                    const ts = o.timestamp ? new Date(parseInt(o.timestamp)).toLocaleTimeString() : '';
+                    const sideClass = o.side === 'buy' ? 'signal-buy' : 'signal-sell';
+                    const state = o.state || '';
+                    const stateColor = state === 'filled' ? '#2dd4bf' : '#f87171';
+                    const price = parseFloat(o.avg_price || o.price || 0);
+                    const priceStr = price > 0 ? price.toFixed(2) : '—';
+                    const qty = o.quantity || o.sz || '0';
+                    const filledQty = o.filled_qty || '0';
+                    return `<div class="order-history-row">
+                        <div>
+                            <div>
+                                <span style="color:${stateColor}; font-weight:600">${state.toUpperCase()}</span>
+                                <span class="${sideClass}" style="margin-left:8px; font-weight:600">${(o.side || '').toUpperCase()}</span>
+                                <span style="margin-left:8px">${o.symbol}</span>
+                            </div>
+                            <div style="font-size:11px; color:#8b949e; margin-top:2px">
+                                ${ts} | qty: ${filledQty}/${qty} @ ${priceStr} | id: ${(o.order_id || '').slice(-8)}
+                            </div>
+                        </div>
+                    </div>`;
+                }).join('');
+            } catch (e) {}
+        }
+
+        // ── Pending Orders ───────────────────────────────────────────────
+        async function loadPendingOrders() {
+            const gw = exchangeToGateway[currentExchange] || document.getElementById('order-gateway').value;
+            try {
+                const resp = await fetch(`/api/order/pending?gateway=${gw}`);
+                const orders = await resp.json();
+                const el = document.getElementById('pending-orders');
+                if (!orders || orders.length === 0) {
+                    el.innerHTML = '<div style="color: #8b949e">No active orders</div>';
+                    return;
+                }
+                el.innerHTML = orders.map(o => {
+                    const sideClass = o.side === 'buy' ? 'signal-buy' : 'signal-sell';
+                    const price = parseFloat(o.price || 0);
+                    const qty = parseFloat(o.quantity || o.sz || 0);
+                    const shortId = (o.order_id || '').slice(-8);
+                    return `<div class="pending-row">
+                        <div>
+                            <div>
+                                <span class="${sideClass}" style="font-weight:600">${(o.side || '').toUpperCase()}</span>
+                                <span style="margin-left:6px">${o.symbol}</span>
+                                <span style="margin-left:6px; color:#8b949e">${qty} @ ${price.toFixed(2)}</span>
+                                <span style="margin-left:6px; color:#8b949e">[${o.state || 'live'}]</span>
+                            </div>
+                            <div style="font-size:11px; color:#8b949e; margin-top:2px;">ID: ${o.order_id || '?'}</div>
+                        </div>
+                        <span>
+                            <button class="btn btn-xs btn-warn" onclick="openAmendModal('${gw}','${o.order_id}','${o.symbol}',${price},${qty})">Amend</button>
+                            <button class="btn btn-xs btn-danger" onclick="cancelOrder('${gw}','${o.order_id}','${o.symbol}')">Cancel</button>
+                        </span>
+                    </div>`;
+                }).join('');
+            } catch (e) {
+                document.getElementById('pending-orders').innerHTML =
+                    '<div style="color: #f87171">Failed to load</div>';
+            }
+        }
+
+        async function cancelOrder(gateway, orderId, symbol) {
+            if (!confirm(`Cancel order ${orderId}?`)) return;
+            try {
+                const resp = await fetch('/api/order/cancel', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ gateway, order_id: orderId, symbol }),
+                });
+                const data = await resp.json();
+                const resultEl = document.getElementById('order-result');
+                resultEl.className = resp.ok ? 'order-result success' : 'order-result error';
+                resultEl.textContent = data.message || data.detail;
+                setTimeout(() => { resultEl.className = 'order-result'; }, 4000);
+                setTimeout(loadPendingOrders, 1000);
+                loadOrderHistory();
+            } catch (e) {}
+        }
+
+        function openAmendModal(gateway, orderId, symbol, price, qty) {
+            document.getElementById('amend-gateway').value = gateway;
+            document.getElementById('amend-order-id').textContent = orderId;
+            document.getElementById('amend-symbol').textContent = symbol;
+            document.getElementById('amend-price').value = price;
+            document.getElementById('amend-quantity').value = qty;
+            document.getElementById('amend-result').className = 'order-result';
+            document.getElementById('amend-modal').style.display = 'flex';
+        }
+
+        function closeAmendModal() {
+            document.getElementById('amend-modal').style.display = 'none';
+        }
+
+        async function submitAmend() {
+            const gateway = document.getElementById('amend-gateway').value;
+            const orderId = document.getElementById('amend-order-id').textContent;
+            const symbol = document.getElementById('amend-symbol').textContent;
+            const price = parseFloat(document.getElementById('amend-price').value) || 0;
+            const quantity = parseFloat(document.getElementById('amend-quantity').value) || 0;
+            const resultEl = document.getElementById('amend-result');
+
+            try {
+                const resp = await fetch('/api/order/amend', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ gateway, order_id: orderId, symbol, price, quantity }),
+                });
+                const data = await resp.json();
+                resultEl.className = resp.ok ? 'order-result success' : 'order-result error';
+                resultEl.textContent = data.message || data.detail;
+                if (resp.ok) {
+                    setTimeout(() => { closeAmendModal(); loadPendingOrders(); }, 1500);
+                }
+                loadOrderHistory();
+            } catch (e) {
+                resultEl.className = 'order-result error';
+                resultEl.textContent = 'Network error';
+            }
+        }
+
+        // Auto-refresh active orders every 3s while Market tab is open
+        let _activeOrdersTimer = null;
+
+        function startActiveOrdersPolling() {
+            stopActiveOrdersPolling();
+            loadPendingOrders();
+            loadOrderHistory();
+            _activeOrdersTimer = setInterval(() => {
+                loadPendingOrders();
+                loadOrderHistory();
+            }, 3000);
+        }
+
+        function stopActiveOrdersPolling() {
+            if (_activeOrdersTimer) {
+                clearInterval(_activeOrdersTimer);
+                _activeOrdersTimer = null;
+            }
+        }
+
+        const origSwitchTab = switchTab;
+        switchTab = function(name) {
+            origSwitchTab(name);
+            if (name === 'depth') {
+                startActiveOrdersPolling();
+            } else {
+                stopActiveOrdersPolling();
+            }
+        };
+
+        // ── Settings ─────────────────────────────────────────────────────
+        async function changePassword() {
+            const cur = document.getElementById('pw-current').value;
+            const nw = document.getElementById('pw-new').value;
+            const confirm = document.getElementById('pw-confirm').value;
+            const el = document.getElementById('pw-result');
+
+            if (!cur || !nw) { el.className = 'order-result error'; el.textContent = 'Fill in all fields'; return; }
+            if (nw !== confirm) { el.className = 'order-result error'; el.textContent = 'Passwords do not match'; return; }
+            if (nw.length < 8) { el.className = 'order-result error'; el.textContent = 'Min 8 characters'; return; }
+
+            try {
+                const resp = await _origFetch('/auth/change-password', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ current_password: cur, new_password: nw }),
+                });
+                const data = await resp.json();
+                el.className = resp.ok ? 'order-result success' : 'order-result error';
+                el.textContent = data.message || data.detail;
+                if (resp.ok) {
+                    document.getElementById('pw-current').value = '';
+                    document.getElementById('pw-new').value = '';
+                    document.getElementById('pw-confirm').value = '';
+                }
+            } catch (e) { el.className = 'order-result error'; el.textContent = 'Network error'; }
+            setTimeout(() => { el.className = 'order-result'; }, 5000);
+        }
+
+        async function load2FAStatus() {
+            try {
+                const resp = await _origFetch('/auth/status');
+                const data = await resp.json();
+                const statusEl = document.getElementById('2fa-status');
+                const setupEl = document.getElementById('2fa-setup');
+
+                if (data.totp_enabled) {
+                    statusEl.innerHTML = '<span style="color:#2dd4bf; font-weight:600;">2FA is ENABLED</span>';
+                    setupEl.innerHTML = `
+                        <div class="form-row">
+                            <label style="width:120px;">Password</label>
+                            <input type="password" id="2fa-disable-pw" placeholder="Confirm password" />
+                        </div>
+                        <div class="form-row" style="justify-content:flex-end;">
+                            <button class="btn btn-danger" style="padding:6px 14px; font-size:12px;" onclick="disable2FA()">Disable 2FA</button>
+                        </div>`;
+                } else {
+                    statusEl.innerHTML = '<span style="color:#f87171;">2FA is DISABLED</span>';
+                    setupEl.innerHTML = `
+                        <div class="form-row" style="justify-content:flex-end;">
+                            <button class="btn btn-primary" onclick="setup2FA()">Enable 2FA</button>
+                        </div>`;
+                }
+            } catch (e) {}
+        }
+
+        async function setup2FA() {
+            const resultEl = document.getElementById('2fa-result');
+            try {
+                const resp = await _origFetch('/auth/2fa/setup', { method: 'POST' });
+                const data = await resp.json();
+                if (!resp.ok) { resultEl.className = 'order-result error'; resultEl.textContent = data.detail; return; }
+
+                document.getElementById('2fa-setup').innerHTML = `
+                    <div style="margin-bottom:12px;">
+                        <div style="font-size:11px; color:#8b949e; margin-bottom:4px;">Manual entry key (copy to your authenticator app):</div>
+                        <div style="background:#0d1117; padding:10px; border-radius:6px; font-size:14px; letter-spacing:2px; word-break:break-all; color:#58a6ff; user-select:all; cursor:text;">${data.secret}</div>
+                    </div>
+                    <div style="margin-bottom:12px;">
+                        <div style="font-size:11px; color:#8b949e; margin-bottom:4px;">Or use this URI:</div>
+                        <div style="background:#0d1117; padding:8px; border-radius:6px; font-size:11px; word-break:break-all; color:#8b949e; user-select:all; cursor:text;">${data.uri}</div>
+                    </div>
+                    <div class="form-row">
+                        <label style="width:120px;">Verify Code</label>
+                        <input type="text" id="2fa-verify-code" placeholder="6-digit code" maxlength="6" inputmode="numeric" />
+                    </div>
+                    <div class="form-row" style="justify-content:flex-end;">
+                        <button class="btn btn-primary" onclick="verify2FA()">Verify & Enable</button>
+                    </div>`;
+            } catch (e) { resultEl.className = 'order-result error'; resultEl.textContent = 'Network error'; }
+        }
+
+        async function verify2FA() {
+            const code = document.getElementById('2fa-verify-code').value.trim();
+            const resultEl = document.getElementById('2fa-result');
+            if (!code) return;
+            try {
+                const resp = await _origFetch('/auth/2fa/verify', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ code }),
+                });
+                const data = await resp.json();
+                resultEl.className = resp.ok ? 'order-result success' : 'order-result error';
+                resultEl.textContent = data.message || data.detail;
+                if (resp.ok) load2FAStatus();
+            } catch (e) { resultEl.className = 'order-result error'; resultEl.textContent = 'Network error'; }
+            setTimeout(() => { resultEl.className = 'order-result'; }, 5000);
+        }
+
+        async function disable2FA() {
+            const pw = document.getElementById('2fa-disable-pw').value;
+            const resultEl = document.getElementById('2fa-result');
+            if (!pw) return;
+            try {
+                const resp = await _origFetch('/auth/2fa/disable', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ password: pw }),
+                });
+                const data = await resp.json();
+                resultEl.className = resp.ok ? 'order-result success' : 'order-result error';
+                resultEl.textContent = data.message || data.detail;
+                if (resp.ok) load2FAStatus();
+            } catch (e) { resultEl.className = 'order-result error'; resultEl.textContent = 'Network error'; }
+            setTimeout(() => { resultEl.className = 'order-result'; }, 5000);
         }
 
         // Start

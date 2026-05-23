@@ -365,14 +365,28 @@ class WebullGateway(BaseGateway):
                          side, quantity, symbol, price or "MKT", order_id)
         return order_id
 
-    async def cancel_order(self, order_id: str) -> None:
+    async def cancel_order(self, order: dict) -> None:
         if not self._require_auth():
             return
+        order_id = order.get("order_id", "")
         try:
             await self._loop.run_in_executor(None, self._wb.cancel_order, order_id)
             self.logger.info("Cancelled order %s", order_id)
         except Exception as exc:
             self.logger.error("cancel_order(%s) error: %s", order_id, exc)
+
+    async def amend_order(self, order: dict) -> None:
+        if not self._require_auth():
+            return
+        order_id = order.get("order_id", "")
+        try:
+            await self._loop.run_in_executor(
+                None, self._wb.modify_order, order_id,
+                order.get("price"), order.get("quantity"),
+            )
+            self.logger.info("Amended order %s", order_id)
+        except Exception as exc:
+            self.logger.error("amend_order(%s) error: %s", order_id, exc)
 
     async def query_positions(self) -> list:
         if not self._require_auth():

@@ -6,22 +6,30 @@ import asyncio
 import json
 import logging
 import os
+import secrets
 import ssl
 import threading
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
 import aiohttp
 import paho.mqtt.client as mqtt
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+import pyotp
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, Depends, HTTPException
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
+from fastapi.middleware.gzip import GZipMiddleware
+from jose import jwt, JWTError
+from passlib.context import CryptContext
+from pydantic import BaseModel
+from starlette.middleware.base import BaseHTTPMiddleware
 import redis.asyncio as aioredis
 
 from core.config import load_env
 from core.logger import get_logger
-from core.zmq_channels import MultiSubscriber, GATEWAY_MARKET_DATA_PORTS
+from core.zmq_channels import MultiSubscriber, Pusher, GATEWAY_MARKET_DATA_PORTS, SIGNAL_PORT
 
 load_env()
 logger = get_logger("view_web")
@@ -29,7 +37,112 @@ logger = get_logger("view_web")
 STATIC_DIR = Path(__file__).parent / "static"
 REDIS_URL = os.environ.get("REDIS_URL", "redis://127.0.0.1:6379")
 
+# ── Authentication ────────────────────────────────────────────────────────────
+
+AUTH_USERNAME = os.environ.get("DASHBOARD_USER", "joshzhou")
+INITIAL_PASSWORD = os.environ.get("DASHBOARD_INITIAL_PASSWORD", "changeme123")
+JWT_ALGORITHM = "HS256"
+JWT_EXPIRY_HOURS = 24
+COOKIE_NAME = "session_token"
+
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+_jwt_secret: str = ""
+
+
+async def _ensure_auth_ready():
+    """Initialize JWT secret and seed initial password on first run."""
+    global _jwt_secret
+    r = await get_redis()
+
+    _jwt_secret = os.environ.get("JWT_SECRET", "")
+    if not _jwt_secret:
+        stored = await r.get("auth:jwt_secret")
+        if stored:
+            _jwt_secret = stored
+        else:
+            _jwt_secret = secrets.token_hex(64)
+            await r.set("auth:jwt_secret", _jwt_secret)
+
+    existing = await r.get(f"auth:user:{AUTH_USERNAME}:password_hash")
+    if not existing:
+        hashed = pwd_context.hash(INITIAL_PASSWORD)
+        pipe = r.pipeline()
+        pipe.set(f"auth:user:{AUTH_USERNAME}:password_hash", hashed)
+        pipe.set(f"auth:user:{AUTH_USERNAME}:totp_enabled", "0")
+        await pipe.execute()
+        logger.info("Seeded initial password for user '%s'", AUTH_USERNAME)
+
+
+def _create_token(username: str) -> str:
+    expire = datetime.now(timezone.utc) + timedelta(hours=JWT_EXPIRY_HOURS)
+    return jwt.encode({"sub": username, "exp": expire}, _jwt_secret, algorithm=JWT_ALGORITHM)
+
+
+def _verify_token(token: str) -> str:
+    payload = jwt.decode(token, _jwt_secret, algorithms=[JWT_ALGORITHM])
+    username = payload.get("sub")
+    if username != AUTH_USERNAME:
+        raise JWTError("wrong user")
+    return username
+
+
+async def _get_current_user(request: Request) -> str:
+    token = request.cookies.get(COOKIE_NAME)
+    if not token:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    try:
+        return _verify_token(token)
+    except JWTError:
+        raise HTTPException(status_code=401, detail="Session expired")
+
+
+async def _authenticate_ws(websocket: WebSocket) -> bool:
+    """Accept the WebSocket, then verify auth. Close with 4001 if invalid."""
+    token = websocket.cookies.get(COOKIE_NAME)
+    await websocket.accept()
+    if not token:
+        await websocket.close(code=4001, reason="Not authenticated")
+        return False
+    try:
+        _verify_token(token)
+        return True
+    except JWTError:
+        await websocket.close(code=4001, reason="Session expired")
+        return False
+
+
+_PUBLIC_PATHS = {"/login", "/auth/login"}
+
+
+class AuthMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        path = request.url.path
+        if path.startswith("/static/") or path in _PUBLIC_PATHS:
+            return await call_next(request)
+        if path.startswith("/ws"):
+            return await call_next(request)
+
+        token = request.cookies.get(COOKIE_NAME)
+        if not token:
+            if path.startswith("/api/") or path.startswith("/auth/"):
+                return JSONResponse({"detail": "Not authenticated"}, status_code=401)
+            return RedirectResponse("/login", status_code=302)
+
+        try:
+            _verify_token(token)
+        except JWTError:
+            if path.startswith("/api/") or path.startswith("/auth/"):
+                return JSONResponse({"detail": "Session expired"}, status_code=401)
+            resp = RedirectResponse("/login", status_code=302)
+            resp.delete_cookie(COOKIE_NAME)
+            return resp
+
+        return await call_next(request)
+
+
 app = FastAPI(title="Trading Dashboard")
+app.add_middleware(AuthMiddleware)
+app.add_middleware(GZipMiddleware, minimum_size=500)
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 _redis = None
@@ -59,8 +172,8 @@ class OKXDepthManager:
         self._ws = None
         self._subscribed: set = set()
         self._local_books: dict = {}
-        self._instruments: dict = {}    # instType -> list
-        self._instruments_ts: dict = {} # instType -> float
+        self._instruments: dict = {}
+        self._instruments_ts: dict = {}
         self._running = False
 
     def _key(self, symbol: str) -> str:
@@ -88,14 +201,28 @@ class OKXDepthManager:
                 "args": [{"channel": "books", "instId": symbol}],
             })
 
+    async def _resubscribe(self, symbol: str):
+        """Force resubscribe to get a fresh snapshot."""
+        if self._ws and not self._ws.closed:
+            await self._ws.send_json({
+                "op": "unsubscribe",
+                "args": [{"channel": "books", "instId": symbol}],
+            })
+            await asyncio.sleep(0.1)
+            await self._ws.send_json({
+                "op": "subscribe",
+                "args": [{"channel": "books", "instId": symbol}],
+            })
+
     async def get_instruments(self, inst_type: str = "SWAP") -> list:
         now = time.time()
         if inst_type in self._instruments and now - self._instruments_ts.get(inst_type, 0) < self.INSTRUMENTS_TTL:
             return self._instruments[inst_type]
 
         url = f"{self.OKX_REST}/api/v5/public/instruments?instType={inst_type}"
+        headers = {"x-simulated-trading": "1"} if self.env == "PAPER" else {}
         try:
-            async with self._session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            async with self._session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
                 data = await resp.json()
                 result = data.get("data", [])
                 self._instruments[inst_type] = result
@@ -122,6 +249,24 @@ class OKXDepthManager:
             if self._running:
                 await asyncio.sleep(5)
 
+    @staticmethod
+    def _compute_checksum(bids: dict, asks: dict) -> int:
+        """OKX checksum: CRC32 of top-25 bids/asks as price:size pairs."""
+        import zlib
+        sorted_bids = sorted(bids.items(), key=lambda x: float(x[0]), reverse=True)[:25]
+        sorted_asks = sorted(asks.items(), key=lambda x: float(x[0]))[:25]
+        parts = []
+        for i in range(max(len(sorted_bids), len(sorted_asks))):
+            if i < len(sorted_bids):
+                parts.append(f"{sorted_bids[i][0]}:{sorted_bids[i][1]}")
+            if i < len(sorted_asks):
+                parts.append(f"{sorted_asks[i][0]}:{sorted_asks[i][1]}")
+        crc = zlib.crc32(":".join(parts).encode())
+        # OKX uses signed 32-bit
+        if crc >= 0x80000000:
+            crc -= 0x100000000
+        return crc
+
     async def _handle_msg(self, data: dict):
         arg = data.get("arg", {})
         if arg.get("channel") != "books":
@@ -138,22 +283,38 @@ class OKXDepthManager:
 
         for record in records:
             if action == "snapshot":
-                book["bids"] = {float(e[0]): float(e[1]) for e in record.get("bids", [])}
-                book["asks"] = {float(e[0]): float(e[1]) for e in record.get("asks", [])}
+                book["bids"] = {e[0]: e[1] for e in record.get("bids", [])}
+                book["asks"] = {e[0]: e[1] for e in record.get("asks", [])}
             else:
                 for e in record.get("bids", []):
-                    p, s = float(e[0]), float(e[1])
-                    book["bids"].pop(p, None) if s == 0 else book["bids"].__setitem__(p, s)
+                    price_str, size_str = e[0], e[1]
+                    if size_str == "0":
+                        book["bids"].pop(price_str, None)
+                    else:
+                        book["bids"][price_str] = size_str
                 for e in record.get("asks", []):
-                    p, s = float(e[0]), float(e[1])
-                    book["asks"].pop(p, None) if s == 0 else book["asks"].__setitem__(p, s)
+                    price_str, size_str = e[0], e[1]
+                    if size_str == "0":
+                        book["asks"].pop(price_str, None)
+                    else:
+                        book["asks"][price_str] = size_str
 
-        top_bids = sorted(book["bids"].items(), reverse=True)[:10]
-        top_asks = sorted(book["asks"].items())[:10]
+            expected_crc = record.get("checksum")
+            if expected_crc is not None:
+                actual_crc = self._compute_checksum(book["bids"], book["asks"])
+                if actual_crc != expected_crc:
+                    logger.warning("OKX checksum mismatch for %s [%s]: expected=%s got=%s, resubscribing",
+                                   symbol, self.env, expected_crc, actual_crc)
+                    self._local_books.pop(symbol, None)
+                    asyncio.create_task(self._resubscribe(symbol))
+                    return
+
+        top_bids = sorted(book["bids"].items(), key=lambda x: float(x[0]), reverse=True)[:25]
+        top_asks = sorted(book["asks"].items(), key=lambda x: float(x[0]))[:25]
         key = self._key(symbol)
         _orderbooks[key] = {
-            "bids": [[p, s] for p, s in top_bids],
-            "asks": [[p, s] for p, s in top_asks],
+            "bids": [[float(p), float(s)] for p, s in top_bids],
+            "asks": [[float(p), float(s)] for p, s in top_asks],
             "timestamp": time.time(),
         }
         _orderbook_seq[key] = _orderbook_seq.get(key, 0) + 1
@@ -400,6 +561,7 @@ async def _zmq_orderbook_subscriber():
 
 @app.on_event("startup")
 async def startup():
+    await _ensure_auth_ready()
     asyncio.create_task(_zmq_orderbook_subscriber())
     for mgr in _depth_managers.values():
         await mgr.start()
@@ -421,6 +583,128 @@ async def get_redis() -> aioredis.Redis:
     if _redis is None:
         _redis = aioredis.from_url(REDIS_URL, decode_responses=True)
     return _redis
+
+
+# ── Auth endpoints ────────────────────────────────────────────────────────────
+
+@app.get("/login")
+async def login_page(request: Request):
+    token = request.cookies.get(COOKIE_NAME)
+    if token:
+        try:
+            _verify_token(token)
+            return RedirectResponse("/", status_code=302)
+        except JWTError:
+            pass
+    return FileResponse(str(STATIC_DIR / "login.html"))
+
+
+class LoginRequest(BaseModel):
+    password: str
+    totp_code: str = ""
+
+
+@app.post("/auth/login")
+async def auth_login(req: LoginRequest):
+    r = await get_redis()
+    stored_hash = await r.get(f"auth:user:{AUTH_USERNAME}:password_hash")
+    if not stored_hash or not pwd_context.verify(req.password, stored_hash):
+        raise HTTPException(401, "Invalid password")
+
+    totp_enabled = await r.get(f"auth:user:{AUTH_USERNAME}:totp_enabled")
+    if totp_enabled == "1":
+        if not req.totp_code:
+            return JSONResponse({"requires_2fa": True})
+        secret = await r.get(f"auth:user:{AUTH_USERNAME}:totp_secret")
+        totp = pyotp.TOTP(secret)
+        if not totp.verify(req.totp_code, valid_window=1):
+            raise HTTPException(401, "Invalid 2FA code")
+
+    token = _create_token(AUTH_USERNAME)
+    response = JSONResponse({"status": "ok"})
+    response.set_cookie(
+        COOKIE_NAME, token,
+        httponly=True, samesite="strict",
+        max_age=JWT_EXPIRY_HOURS * 3600,
+    )
+    return response
+
+
+@app.post("/auth/logout")
+async def auth_logout():
+    response = JSONResponse({"status": "ok"})
+    response.delete_cookie(COOKIE_NAME)
+    return response
+
+
+class ChangePasswordRequest(BaseModel):
+    current_password: str
+    new_password: str
+
+
+@app.post("/auth/change-password")
+async def change_password(req: ChangePasswordRequest, user: str = Depends(_get_current_user)):
+    r = await get_redis()
+    stored_hash = await r.get(f"auth:user:{AUTH_USERNAME}:password_hash")
+    if not pwd_context.verify(req.current_password, stored_hash):
+        raise HTTPException(401, "Current password is incorrect")
+    if len(req.new_password) < 8:
+        raise HTTPException(400, "New password must be at least 8 characters")
+    new_hash = pwd_context.hash(req.new_password)
+    await r.set(f"auth:user:{AUTH_USERNAME}:password_hash", new_hash)
+    return {"status": "ok", "message": "Password changed"}
+
+
+@app.get("/auth/status")
+async def auth_status(user: str = Depends(_get_current_user)):
+    r = await get_redis()
+    totp_enabled = await r.get(f"auth:user:{AUTH_USERNAME}:totp_enabled")
+    return {"username": AUTH_USERNAME, "totp_enabled": totp_enabled == "1"}
+
+
+@app.post("/auth/2fa/setup")
+async def setup_2fa(user: str = Depends(_get_current_user)):
+    r = await get_redis()
+    totp_enabled = await r.get(f"auth:user:{AUTH_USERNAME}:totp_enabled")
+    if totp_enabled == "1":
+        raise HTTPException(400, "2FA is already enabled. Disable it first.")
+    secret = pyotp.random_base32()
+    await r.set(f"auth:user:{AUTH_USERNAME}:totp_secret", secret)
+    totp = pyotp.TOTP(secret)
+    uri = totp.provisioning_uri(name=AUTH_USERNAME, issuer_name="TradingDashboard")
+    return {"secret": secret, "uri": uri}
+
+
+class Verify2FARequest(BaseModel):
+    code: str
+
+
+@app.post("/auth/2fa/verify")
+async def verify_2fa(req: Verify2FARequest, user: str = Depends(_get_current_user)):
+    r = await get_redis()
+    secret = await r.get(f"auth:user:{AUTH_USERNAME}:totp_secret")
+    if not secret:
+        raise HTTPException(400, "Run 2FA setup first")
+    totp = pyotp.TOTP(secret)
+    if not totp.verify(req.code, valid_window=1):
+        raise HTTPException(400, "Invalid code. Try again.")
+    await r.set(f"auth:user:{AUTH_USERNAME}:totp_enabled", "1")
+    return {"status": "ok", "message": "2FA enabled"}
+
+
+class Disable2FARequest(BaseModel):
+    password: str
+
+
+@app.post("/auth/2fa/disable")
+async def disable_2fa(req: Disable2FARequest, user: str = Depends(_get_current_user)):
+    r = await get_redis()
+    stored_hash = await r.get(f"auth:user:{AUTH_USERNAME}:password_hash")
+    if not pwd_context.verify(req.password, stored_hash):
+        raise HTTPException(401, "Invalid password")
+    await r.set(f"auth:user:{AUTH_USERNAME}:totp_enabled", "0")
+    await r.delete(f"auth:user:{AUTH_USERNAME}:totp_secret")
+    return {"status": "ok", "message": "2FA disabled"}
 
 
 # ── REST endpoints ────────────────────────────────────────────────────────────
@@ -513,6 +797,131 @@ async def get_symbols(exchange: str = "OKX", env: str = "PAPER"):
     return sorted(k[len(prefix):] for k in _orderbooks if k.startswith(prefix))
 
 
+class ManualOrderRequest(BaseModel):
+    gateway: str
+    symbol: str
+    side: str
+    order_type: str = "limit"
+    price: float = 0.0
+    quantity: float = 1.0
+
+
+class CancelOrderRequest(BaseModel):
+    gateway: str
+    symbol: str
+    order_id: str
+
+
+class AmendOrderRequest(BaseModel):
+    gateway: str
+    symbol: str
+    order_id: str
+    price: float = 0.0
+    quantity: float = 0.0
+
+
+_signal_pusher: Optional[Pusher] = None
+
+
+def _get_signal_pusher() -> Pusher:
+    global _signal_pusher
+    if _signal_pusher is None:
+        _signal_pusher = Pusher(SIGNAL_PORT, bind=False)
+    return _signal_pusher
+
+
+@app.post("/api/order")
+async def place_manual_order(req: ManualOrderRequest):
+    signal = {
+        "event_type": "signal",
+        "strategy": "_manual_",
+        "gateway": req.gateway,
+        "symbol": req.symbol,
+        "side": req.side,
+        "order_type": req.order_type,
+        "price": req.price,
+        "quantity": req.quantity,
+        "reason": "manual order via dashboard",
+        "timestamp": time.time(),
+    }
+    pusher = _get_signal_pusher()
+    await pusher.push(signal)
+    r = await get_redis()
+    await r.xadd("manual_orders", {
+        "gateway": req.gateway,
+        "symbol": req.symbol,
+        "side": req.side,
+        "order_type": req.order_type,
+        "price": str(req.price),
+        "quantity": str(req.quantity),
+        "timestamp": str(time.time()),
+        "action": "new",
+    }, maxlen=500)
+    return {"status": "ok", "message": f"{req.side} {req.quantity} {req.symbol} sent to risk engine"}
+
+
+@app.post("/api/order/cancel")
+async def cancel_order(req: CancelOrderRequest):
+    event = {
+        "event_type": "order_cancel",
+        "gateway": req.gateway,
+        "symbol": req.symbol,
+        "order_id": req.order_id,
+        "timestamp": time.time(),
+    }
+    pusher = _get_signal_pusher()
+    await pusher.push(event)
+    r = await get_redis()
+    await r.xadd("manual_orders", {
+        "gateway": req.gateway,
+        "symbol": req.symbol,
+        "order_id": req.order_id,
+        "timestamp": str(time.time()),
+        "action": "cancel",
+    }, maxlen=500)
+    return {"status": "ok", "message": f"Cancel {req.order_id} sent to {req.gateway}"}
+
+
+@app.post("/api/order/amend")
+async def amend_order(req: AmendOrderRequest):
+    event = {
+        "event_type": "order_amend",
+        "gateway": req.gateway,
+        "symbol": req.symbol,
+        "order_id": req.order_id,
+        "price": req.price,
+        "quantity": req.quantity,
+        "timestamp": time.time(),
+    }
+    pusher = _get_signal_pusher()
+    await pusher.push(event)
+    r = await get_redis()
+    await r.xadd("manual_orders", {
+        "gateway": req.gateway,
+        "symbol": req.symbol,
+        "order_id": req.order_id,
+        "price": str(req.price),
+        "quantity": str(req.quantity),
+        "timestamp": str(time.time()),
+        "action": "amend",
+    }, maxlen=500)
+    return {"status": "ok", "message": f"Amend {req.order_id} sent to {req.gateway}"}
+
+
+@app.get("/api/order/history")
+async def get_order_history(count: int = 50):
+    r = await get_redis()
+    orders = await r.xrange("finished_orders", "-", "+", count=count)
+    return [{"id": o[0], **o[1]} for o in orders]
+
+
+@app.get("/api/order/pending")
+async def get_pending_orders(gateway: str = "okx"):
+    r = await get_redis()
+    raw = await r.get(f"pending_orders:{gateway}")
+    return json.loads(raw) if raw else []
+
+
 @app.get("/api/depth/{symbol:path}")
 async def get_depth(symbol: str, exchange: str = "OKX", env: str = "PAPER"):
     key = f"{exchange.upper()}:{env.upper()}:{symbol}"
@@ -564,21 +973,34 @@ async def get_exchange_instruments(
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
-    await websocket.accept()
+    if not await _authenticate_ws(websocket):
+        return
+    # _authenticate_ws already accepted if valid
     r = await get_redis()
     try:
         while True:
-            strategies = await r.get("dashboard:strategies")
-            prices = await r.get("dashboard:prices")
-            heartbeat_keys = await r.keys("heartbeat:*")
+            pipe = r.pipeline()
+            pipe.get("dashboard:strategies")
+            pipe.get("dashboard:prices")
+            pipe.keys("heartbeat:*")
+            strategies_raw, prices_raw, heartbeat_keys = await pipe.execute()
+
             heartbeats = {}
-            for key in heartbeat_keys:
-                name = key.replace("heartbeat:", "")
-                heartbeats[name] = await r.hgetall(key)
+            if heartbeat_keys:
+                pipe2 = r.pipeline()
+                for key in heartbeat_keys:
+                    pipe2.hgetall(key)
+                    pipe2.ttl(key)
+                results = await pipe2.execute()
+                for i, key in enumerate(heartbeat_keys):
+                    name = key.replace("heartbeat:", "")
+                    hb = results[i * 2]
+                    hb["ttl"] = results[i * 2 + 1]
+                    heartbeats[name] = hb
 
             await websocket.send_json({
-                "strategies": json.loads(strategies) if strategies else {},
-                "prices": json.loads(prices) if prices else {},
+                "strategies": json.loads(strategies_raw) if strategies_raw else {},
+                "prices": json.loads(prices_raw) if prices_raw else {},
                 "heartbeats": heartbeats,
                 "timestamp": asyncio.get_event_loop().time(),
             })
@@ -593,7 +1015,8 @@ async def depth_websocket(websocket: WebSocket):
     Client sends {symbol, exchange, env} to select a feed.
     Server subscribes via the matching manager and streams live updates.
     """
-    await websocket.accept()
+    if not await _authenticate_ws(websocket):
+        return
 
     state = {"symbol": None, "exchange": "OKX", "env": "PAPER",
              "region": "US", "cache_key": None, "last_seq": -1}

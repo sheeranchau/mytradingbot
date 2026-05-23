@@ -28,11 +28,13 @@ def load_strategies() -> list:
 
 
 def main():
+    config = load_settings()
     strategies = load_strategies()
     if not strategies:
         print("[StrategyRunner] No strategies configured. Exiting.")
         return
-    container = StrategyContainer(strategies=strategies)
+    redis_url = config.get("redis", {}).get("url", "redis://127.0.0.1:6379")
+    container = StrategyContainer(strategies=strategies, redis_url=redis_url)
     asyncio.run(container.start())
 
 

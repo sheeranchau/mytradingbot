@@ -7,7 +7,7 @@
 #         trade_env: "REAL"     -> REAL money (requires unlock password)
 
 redis:
-  url: "redis://127.0.0.1:6379"
+  url: "redis://default:${REDIS_PASSWORD}@127.0.0.1:6379"
   db: 0
 
 # Exchange gateways

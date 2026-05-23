@@ -57,7 +57,9 @@ class BaseGateway(ProcessBase, ABC):
                 if event_type == EventType.ORDER_NEW:
                     await self.send_order(order_data)
                 elif event_type == EventType.ORDER_CANCEL:
-                    await self.cancel_order(order_data.get("order_id", ""))
+                    await self.cancel_order(order_data)
+                elif event_type == EventType.ORDER_AMEND:
+                    await self.amend_order(order_data)
             except Exception as e:
                 self.logger.error("Order listener error: %s", e)
                 await asyncio.sleep(1)
@@ -98,8 +100,13 @@ class BaseGateway(ProcessBase, ABC):
         ...
 
     @abstractmethod
-    async def cancel_order(self, order_id: str) -> None:
+    async def cancel_order(self, order: dict) -> None:
         """Cancel order on exchange."""
+        ...
+
+    @abstractmethod
+    async def amend_order(self, order: dict) -> None:
+        """Amend order on exchange (change price/quantity)."""
         ...
 
     @abstractmethod

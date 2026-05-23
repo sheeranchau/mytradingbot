@@ -118,7 +118,8 @@ class FUTUGateway(BaseGateway):
             self.logger.error("Order failed: %s", data)
             return ""
 
-    async def cancel_order(self, order_id: str) -> None:
+    async def cancel_order(self, order: dict) -> None:
+        order_id = order.get("order_id", "")
         loop = asyncio.get_event_loop()
         await loop.run_in_executor(None, self._cancel_sync, order_id)
 
@@ -128,6 +129,22 @@ class FUTUGateway(BaseGateway):
             modify_order_op=2,  # cancel
             order_id=order_id,
             qty=0, price=0,
+            trd_env=trd_env,
+        )
+
+    async def amend_order(self, order: dict) -> None:
+        order_id = order.get("order_id", "")
+        price = order.get("price", 0)
+        qty = order.get("quantity", 0)
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, self._amend_sync, order_id, price, qty)
+
+    def _amend_sync(self, order_id: str, price: float, qty: float) -> None:
+        trd_env = TrdEnv.SIMULATE if self.trade_env == "SIMULATE" else TrdEnv.REAL
+        self._trade_ctx.modify_order(
+            modify_order_op=1,  # amend
+            order_id=order_id,
+            qty=qty, price=price,
             trd_env=trd_env,
         )
 
