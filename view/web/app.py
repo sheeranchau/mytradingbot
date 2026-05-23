@@ -922,6 +922,30 @@ async def get_pending_orders(gateway: str = "okx"):
     return json.loads(raw) if raw else []
 
 
+@app.get("/api/accounts")
+async def list_accounts():
+    r = await get_redis()
+    raw = await r.hgetall("accounts")
+    return [json.loads(v) for v in raw.values()]
+
+
+@app.get("/api/account/{acct_id}")
+async def get_account_info(acct_id: str):
+    r = await get_redis()
+    config_raw = await r.get(f"account:{acct_id}:config")
+    trading_raw = await r.get(f"account:{acct_id}:trading")
+    funding_raw = await r.get(f"account:{acct_id}:funding")
+    earning_raw = await r.get(f"account:{acct_id}:earning")
+    positions_raw = await r.get(f"account:{acct_id}:positions")
+    return {
+        "config": json.loads(config_raw) if config_raw else None,
+        "trading": json.loads(trading_raw) if trading_raw else None,
+        "funding": json.loads(funding_raw) if funding_raw else [],
+        "earning": json.loads(earning_raw) if earning_raw else [],
+        "positions": json.loads(positions_raw) if positions_raw else [],
+    }
+
+
 @app.get("/api/depth/{symbol:path}")
 async def get_depth(symbol: str, exchange: str = "OKX", env: str = "PAPER"):
     key = f"{exchange.upper()}:{env.upper()}:{symbol}"

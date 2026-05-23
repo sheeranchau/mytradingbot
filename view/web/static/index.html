@@ -189,6 +189,55 @@
             color: #c9d1d9;
         }
 
+        /* Account tables */
+        .acct-summary {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+            gap: 12px;
+            margin-bottom: 16px;
+        }
+        .acct-stat {
+            background: #0d1117;
+            border: 1px solid #21262d;
+            border-radius: 6px;
+            padding: 12px;
+        }
+        .acct-stat-label {
+            font-size: 11px;
+            color: #8b949e;
+            text-transform: uppercase;
+            letter-spacing: 0.3px;
+            margin-bottom: 4px;
+        }
+        .acct-stat-value {
+            font-size: 16px;
+            font-weight: 600;
+            color: #e1e4e8;
+            font-variant-numeric: tabular-nums;
+        }
+        .acct-table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+        .acct-table th {
+            text-align: right;
+            padding: 8px 10px;
+            color: #8b949e;
+            font-size: 11px;
+            border-bottom: 1px solid #30363d;
+            text-transform: uppercase;
+        }
+        .acct-table th:first-child { text-align: left; }
+        .acct-table td {
+            padding: 7px 10px;
+            border-bottom: 1px solid #21262d;
+            text-align: right;
+            font-variant-numeric: tabular-nums;
+            font-size: 12px;
+        }
+        .acct-table td:first-child { text-align: left; font-weight: 600; color: #58a6ff; }
+        .acct-table tr:last-child td { border-bottom: none; }
+
         /* Tab navigation */
         .tabs {
             background: #161b22;
@@ -480,6 +529,7 @@
 
     <div class="tabs">
         <button class="tab-btn active" onclick="switchTab('dashboard')">Dashboard</button>
+        <button class="tab-btn" onclick="switchTab('account')">Account</button>
         <button class="tab-btn" onclick="switchTab('depth')">Market</button>
         <button class="tab-btn" onclick="switchTab('settings')">Settings</button>
     </div>
@@ -502,6 +552,39 @@
             <!-- Strategies -->
             <div class="section-title">Strategies</div>
             <div id="strategies"></div>
+        </div>
+    </div>
+
+    <!-- Account tab -->
+    <div id="tab-account" class="tab-pane">
+        <div class="container">
+            <div style="margin-bottom:12px; display:flex; align-items:center; gap:12px;">
+                <label style="font-size:12px; color:#8b949e; text-transform:uppercase;">Account</label>
+                <select id="acct-selector" class="depth-select" onchange="loadAccountInfo()" style="min-width:200px;"></select>
+            </div>
+            <div class="card" style="margin-bottom:16px;">
+                <div class="card-title">Account Overview</div>
+                <div id="acct-config" style="font-size:12px; color:#8b949e; margin-bottom:12px;"></div>
+                <div id="acct-summary" class="acct-summary"></div>
+            </div>
+            <div class="card" style="margin-bottom:16px;">
+                <div class="card-title">Open Positions</div>
+                <div id="acct-positions" style="overflow-x:auto;"></div>
+            </div>
+            <div class="grid grid-2" style="margin-bottom:16px;">
+                <div class="card">
+                    <div class="card-title">Trading Account (per currency)</div>
+                    <div id="acct-trading-details" style="overflow-x:auto;"></div>
+                </div>
+                <div class="card">
+                    <div class="card-title">Funding Account</div>
+                    <div id="acct-funding" style="overflow-x:auto;"></div>
+                </div>
+            </div>
+            <div class="card">
+                <div class="card-title">Earning</div>
+                <div id="acct-earning" style="overflow-x:auto;"></div>
+            </div>
         </div>
     </div>
 
@@ -770,8 +853,6 @@
                     if (signalHistory[name].length > 50) signalHistory[name].shift();
                 }
 
-                const posCount = Object.keys(s.positions || {}).filter(k => s.positions[k] !== 0).length;
-
                 return `<div class="strategy-card">
                     <div class="strategy-header">
                         <div>
@@ -799,13 +880,9 @@
                             <div class="stat-label">Signals</div>
                             <div class="stat-value stat-neutral">${s.signal_count || 0}</div>
                         </div>
-                        <div class="stat-box">
-                            <div class="stat-label">Positions</div>
-                            <div class="stat-value ${posCount > 0 ? 'stat-positive' : 'stat-neutral'}">${posCount > 0 ? posCount + ' open' : 'flat'}</div>
-                        </div>
                     </div>
 
-                    ${renderPositions(s.positions)}
+                    ${renderStatus(s.status, s.status_schema)}
                     ${renderParams(name, s.params, s.params_schema)}
                     ${renderSignalLog(name)}
                 </div>`;
@@ -814,31 +891,30 @@
             document.getElementById('strategies').innerHTML = html;
         }
 
-        function renderPositions(positions) {
-            const entries = Object.entries(positions || {}).filter(([, qty]) => qty !== 0);
-            if (entries.length === 0) return '';
+        function renderStatus(status, schema) {
+            if (!status || Object.keys(status).length === 0) return '';
+            const schemaMap = {};
+            if (Array.isArray(schema)) schema.forEach(s => schemaMap[s.name] = s);
 
-            const rows = entries.map(([symbol, qty]) => {
-                const side = qty > 0 ? 'LONG' : 'SHORT';
-                const color = qty > 0 ? 'stat-positive' : 'stat-negative';
-                return `<tr>
-                    <td>${symbol}</td>
-                    <td class="${color}">${side}</td>
-                    <td>${Math.abs(qty)}</td>
-                </tr>`;
+            const rows = Object.entries(status).map(([key, value]) => {
+                const desc = schemaMap[key] ? (schemaMap[key].desc || '') : '';
+                const display = typeof value === 'number' ? value.toLocaleString(undefined, {maximumFractionDigits: 6}) : String(value);
+                return `<tr><td><strong>${key}</strong></td><td>${display}</td><td class="desc">${desc}</td></tr>`;
             }).join('');
 
-            return `<table class="positions-table" style="margin-bottom: 12px">
-                <tr><th>Symbol</th><th>Side</th><th>Quantity</th></tr>
-                ${rows}
-            </table>`;
+            return `<div style="margin-bottom:12px">
+                <div style="font-size:11px; color:#8b949e; margin-bottom:4px;">STATUS (read-only)</div>
+                <table class="params-table">${rows}</table>
+            </div>`;
         }
 
         function renderParams(strategyName, params, schema) {
             if (!params || Object.keys(params).length === 0) return '';
+            const schemaMap = {};
+            if (Array.isArray(schema)) schema.forEach(s => schemaMap[s.name] = s);
 
             const rows = Object.entries(params).map(([key, value]) => {
-                const desc = (schema && schema[key]) ? schema[key].desc : '';
+                const desc = schemaMap[key] ? (schemaMap[key].desc || '') : '';
                 return `<tr>
                     <td><strong>${key}</strong></td>
                     <td><input type="text" id="param-${strategyName}-${key}" value="${value}" /></td>
@@ -846,13 +922,13 @@
                 </tr>`;
             }).join('');
 
-            return `<table class="params-table" style="margin-bottom: 12px">
-                <tr><th>Parameter</th><th>Value</th><th>Description</th></tr>
-                ${rows}
-            </table>
-            <button class="btn btn-primary" onclick="saveParams('${strategyName}', ${JSON.stringify(Object.keys(params))})">
-                Save Parameters
-            </button>`;
+            return `<div style="margin-bottom:12px">
+                <div style="font-size:11px; color:#8b949e; margin-bottom:4px;">PARAMETERS</div>
+                <table class="params-table">${rows}</table>
+                <button class="btn btn-primary" style="margin-top:8px" onclick="saveParams('${strategyName}', ${JSON.stringify(Object.keys(params))})">
+                    Save Parameters
+                </button>
+            </div>`;
         }
 
         function renderSignalLog(strategyName) {
@@ -911,12 +987,160 @@
             document.querySelectorAll('.tab-btn').forEach(b => {
                 if (b.getAttribute('onclick') === `switchTab('${name}')`) b.classList.add('active');
             });
+            if (name === 'account') {
+                startAcctRefresh();
+            } else {
+                stopAcctRefresh();
+            }
             if (name === 'depth') {
                 if (allInstruments.length === 0) loadInstruments();
                 connectDepthWS();
             }
             if (name === 'settings') {
                 load2FAStatus();
+            }
+        }
+
+        // ── Account ──────────────────────────────────────────────────────────
+        let acctRefreshTimer = null;
+        async function startAcctRefresh() {
+            stopAcctRefresh();
+            await loadAccountsList();
+            await loadAccountInfo();
+            acctRefreshTimer = setInterval(loadAccountInfo, 3000);
+        }
+        function stopAcctRefresh() {
+            if (acctRefreshTimer) { clearInterval(acctRefreshTimer); acctRefreshTimer = null; }
+        }
+
+        async function loadAccountsList() {
+            try {
+                const resp = await fetch('/api/accounts');
+                const accounts = await resp.json();
+                const sel = document.getElementById('acct-selector');
+                const prev = sel.value;
+                sel.innerHTML = '';
+                accounts.forEach(a => {
+                    const opt = document.createElement('option');
+                    opt.value = a.acct_id;
+                    const modeTag = a.mode === 'DEMO' ? '🧪 DEMO' : '🔴 LIVE';
+                    opt.textContent = `${a.exchange} — ${modeTag} (${a.acct_id})`;
+                    sel.appendChild(opt);
+                });
+                if (prev && [...sel.options].some(o => o.value === prev)) {
+                    sel.value = prev;
+                }
+            } catch (e) {}
+        }
+
+        function fmtNum(v, decimals = 2) {
+            const n = parseFloat(v || 0);
+            if (n === 0) return '—';
+            if (Math.abs(n) >= 1e6) return n.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2});
+            return n.toFixed(decimals);
+        }
+
+        async function loadAccountInfo() {
+            try {
+                const acctId = document.getElementById('acct-selector').value;
+                if (!acctId) return;
+                const resp = await fetch(`/api/account/${acctId}`);
+                const data = await resp.json();
+
+                const cfgEl = document.getElementById('acct-config');
+                if (data.config) {
+                    const c = data.config;
+                    cfgEl.innerHTML = `<span style="color:#58a6ff;">AcctId:</span> ${c.acct_id} &nbsp;|&nbsp; `
+                        + `<span style="color:#58a6ff;">UID:</span> ${c.uid} &nbsp;|&nbsp; `
+                        + `<span style="color:#58a6ff;">Account Level:</span> ${c.acct_level_name} (${c.acct_level}) &nbsp;|&nbsp; `
+                        + `<span style="color:#58a6ff;">Position Mode:</span> ${c.pos_mode}`;
+                } else {
+                    cfgEl.innerHTML = '<span style="color:#8b949e;">No config data</span>';
+                }
+
+                const sumEl = document.getElementById('acct-summary');
+                if (data.trading && data.trading.summary) {
+                    const s = data.trading.summary;
+                    const mgnRatio = s.mgnRatio ? (parseFloat(s.mgnRatio) * 100).toFixed(1) + '%' : '—';
+                    const stats = [
+                        ['Total Equity', fmtNum(s.totalEq)],
+                        ['Adjusted Equity', fmtNum(s.adjEq)],
+                        ['Margin Ratio', mgnRatio],
+                        ['IMR', fmtNum(s.imr)],
+                        ['MMR', fmtNum(s.mmr)],
+                        ['Order Frozen', fmtNum(s.ordFroz)],
+                        ['Notional USD', fmtNum(s.notionalUsd)],
+                    ];
+                    sumEl.innerHTML = stats.map(([label, val]) =>
+                        `<div class="acct-stat"><div class="acct-stat-label">${label}</div><div class="acct-stat-value">${val}</div></div>`
+                    ).join('');
+                } else {
+                    sumEl.innerHTML = '<div style="color:#8b949e;">No trading data</div>';
+                }
+
+                const posEl = document.getElementById('acct-positions');
+                if (data.positions && data.positions.length > 0) {
+                    const rows = data.positions.map(p => {
+                        const upl = parseFloat(p.upl || 0);
+                        const uplPct = parseFloat(p.uplRatio || 0) * 100;
+                        const uplColor = upl >= 0 ? '#2dd4bf' : '#f87171';
+                        return `<tr><td>${p.instId}</td><td>${p.posSide}</td><td>${p.pos}</td>`
+                            + `<td>${fmtNum(p.avgPx)}</td><td>${fmtNum(p.markPx)}</td>`
+                            + `<td>${p.liqPx || '—'}</td>`
+                            + `<td style="color:${uplColor}">${fmtNum(p.upl)} (${uplPct.toFixed(2)}%)</td>`
+                            + `<td>${p.lever}x</td><td>${fmtNum(p.margin)}</td>`
+                            + `<td>${p.mgnMode}</td><td>${fmtNum(p.notionalUsd)}</td></tr>`;
+                    }).join('');
+                    posEl.innerHTML = `<table class="acct-table"><thead><tr>`
+                        + `<th style="text-align:left">Instrument</th><th>Side</th><th>Size</th>`
+                        + `<th>Avg Px</th><th>Mark Px</th><th>Liq Px</th><th>UPL</th>`
+                        + `<th>Lever</th><th>Margin</th><th>Mode</th><th>Notional USD</th>`
+                        + `</tr></thead><tbody>${rows}</tbody></table>`;
+                } else {
+                    posEl.innerHTML = '<div style="color:#8b949e;">No open positions</div>';
+                }
+
+                const detEl = document.getElementById('acct-trading-details');
+                if (data.trading && data.trading.details && data.trading.details.length > 0) {
+                    const rows = data.trading.details.map(d =>
+                        `<tr><td>${d.ccy}</td><td>${fmtNum(d.eq)}</td><td>${fmtNum(d.cashBal)}</td>`
+                        + `<td>${fmtNum(d.availEq)}</td><td>${fmtNum(d.frozenBal)}</td>`
+                        + `<td>${fmtNum(d.ordFrozen)}</td><td style="color:${parseFloat(d.upl||0)>=0?'#2dd4bf':'#f87171'}">${fmtNum(d.upl)}</td>`
+                        + `<td>${fmtNum(d.eqUsd)}</td></tr>`
+                    ).join('');
+                    detEl.innerHTML = `<table class="acct-table"><thead><tr>`
+                        + `<th style="text-align:left">CCY</th><th>Equity</th><th>Cash Bal</th>`
+                        + `<th>Avail Eq</th><th>Frozen</th><th>Ord Frozen</th><th>UPL</th><th>Eq USD</th>`
+                        + `</tr></thead><tbody>${rows}</tbody></table>`;
+                } else {
+                    detEl.innerHTML = '<div style="color:#8b949e;">No currency details</div>';
+                }
+
+                const fundEl = document.getElementById('acct-funding');
+                if (data.funding && data.funding.length > 0) {
+                    const rows = data.funding.map(f =>
+                        `<tr><td>${f.ccy}</td><td>${fmtNum(f.bal)}</td><td>${fmtNum(f.availBal)}</td><td>${fmtNum(f.frozenBal)}</td></tr>`
+                    ).join('');
+                    fundEl.innerHTML = `<table class="acct-table"><thead><tr>`
+                        + `<th style="text-align:left">CCY</th><th>Balance</th><th>Available</th><th>Frozen</th>`
+                        + `</tr></thead><tbody>${rows}</tbody></table>`;
+                } else {
+                    fundEl.innerHTML = '<div style="color:#8b949e;">No funding balances</div>';
+                }
+
+                const earnEl = document.getElementById('acct-earning');
+                if (data.earning && data.earning.length > 0) {
+                    const rows = data.earning.map(e =>
+                        `<tr><td>${e.ccy}</td><td>${fmtNum(e.amt)}</td><td>${fmtNum(e.earnings, 6)}</td><td>${fmtNum(e.rate, 6)}</td></tr>`
+                    ).join('');
+                    earnEl.innerHTML = `<table class="acct-table"><thead><tr>`
+                        + `<th style="text-align:left">CCY</th><th>Amount</th><th>Earnings</th><th>Rate</th>`
+                        + `</tr></thead><tbody>${rows}</tbody></table>`;
+                } else {
+                    earnEl.innerHTML = '<div style="color:#8b949e;">No earning positions</div>';
+                }
+            } catch (e) {
+                console.error('Failed to load account info:', e);
             }
         }
 
@@ -1285,7 +1509,7 @@
                     const ts = o.timestamp ? new Date(parseInt(o.timestamp)).toLocaleTimeString() : '';
                     const sideClass = o.side === 'buy' ? 'signal-buy' : 'signal-sell';
                     const state = o.state || '';
-                    const stateColor = state === 'filled' ? '#2dd4bf' : '#f87171';
+                    const stateColor = state === 'filled' ? '#2dd4bf' : state === 'rejected' ? '#f59e0b' : '#f87171';
                     const price = parseFloat(o.avg_price || o.price || 0);
                     const priceStr = price > 0 ? price.toFixed(2) : '—';
                     const qty = o.quantity || o.sz || '0';
@@ -1298,8 +1522,8 @@
                                 <span style="margin-left:8px">${o.symbol}</span>
                             </div>
                             <div style="font-size:11px; color:#8b949e; margin-top:2px">
-                                ${ts} | qty: ${filledQty}/${qty} @ ${priceStr} | id: ${(o.order_id || '').slice(-8)}
-                            </div>
+                                ${ts} | qty: ${filledQty}/${qty} @ ${priceStr}${o.order_id ? ` | id: ${o.order_id.slice(-8)}` : ''}
+                            </div>${o.comment ? `<div style="font-size:11px; color:#f59e0b; margin-top:2px">${o.comment}</div>` : ''}
                         </div>
                     </div>`;
                 }).join('');

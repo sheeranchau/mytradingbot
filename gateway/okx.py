@@ -36,8 +36,10 @@ class OKXGateway(BaseGateway):
         self.passphrase = passphrase
         self.symbols = symbols
         self.simulated = simulated
+        self.acct_id = "okx_demo" if simulated else "okx_live"
         # Local order book state per symbol for incremental update management
         self._orderbooks: dict = {}
+        self._last_pos_update: float = 0
 
         # Select endpoints based on mode
         if simulated:
@@ -81,6 +83,7 @@ class OKXGateway(BaseGateway):
             self.logger.info("Authentication successful")
             await self._subscribe_private()
             await self._sync_pending_orders()
+            await self._sync_account_info()
         else:
             self.logger.info("No API credentials — running in market-data-only mode")
 
@@ -108,11 +111,12 @@ class OKXGateway(BaseGateway):
             raise ConnectionError(f"OKX auth failed: {resp}")
 
     async def _subscribe_private(self) -> None:
-        """Subscribe to order and position updates."""
-        args = []
-        for symbol in self.symbols:
-            args.append({"channel": "orders", "instId": symbol})
-            args.append({"channel": "positions", "instId": symbol})
+        """Subscribe to order, position, and account updates for all instruments."""
+        args = [
+            {"channel": "orders", "instType": "ANY"},
+            {"channel": "positions", "instType": "ANY"},
+            {"channel": "account"},
+        ]
         await self._ws_private.send_json({"op": "subscribe", "args": args})
 
     async def _stream_market_data(self) -> None:
@@ -177,15 +181,20 @@ class OKXGateway(BaseGateway):
 
         for record in records:
             if channel == "tickers":
+                last_px = record.get("last", "0")
                 await self.publish_tick(symbol, {
                     "bid": float(record.get("bidPx", 0)),
                     "ask": float(record.get("askPx", 0)),
                     "bid_size": float(record.get("bidSz", 0)),
                     "ask_size": float(record.get("askSz", 0)),
-                    "last": float(record.get("last", 0)),
+                    "last": float(last_px),
                     "last_size": float(record.get("lastSz", 0)),
                     "timestamp": time.time(),
                 })
+                now = time.time()
+                if now - self._last_pos_update >= 2:
+                    self._last_pos_update = now
+                    await self._update_position_mark_price(symbol, last_px)
             elif channel == "books":
                 if symbol not in self._orderbooks:
                     self._orderbooks[symbol] = {"bids": {}, "asks": {}}
@@ -273,6 +282,192 @@ class OKXGateway(BaseGateway):
                         "timestamp": time.time(),
                     })
 
+            elif channel == "account":
+                await self._store_trading_account(record)
+
+            elif channel == "positions":
+                await self._store_positions(record)
+
+    async def _store_positions(self, record: dict) -> None:
+        """Store position update from WS push. Replaces per-instrument entry."""
+        try:
+            r = self.redis.client
+            key = f"account:{self.acct_id}:positions"
+            raw = await r.get(key)
+            positions = json.loads(raw) if raw else []
+            inst_id = record.get("instId", "")
+            pos_side = record.get("posSide", "net")
+            positions = [p for p in positions
+                         if not (p["instId"] == inst_id and p["posSide"] == pos_side)]
+            pos_amt = float(record.get("pos", 0))
+            if pos_amt != 0:
+                positions.append({
+                    "instId": record.get("instId", ""),
+                    "posSide": pos_side,
+                    "pos": record.get("pos", "0"),
+                    "avgPx": record.get("avgPx", "0"),
+                    "upl": record.get("upl", "0"),
+                    "uplRatio": record.get("uplRatio", "0"),
+                    "lever": record.get("lever", "0"),
+                    "liqPx": record.get("liqPx", ""),
+                    "markPx": record.get("markPx", "0"),
+                    "margin": record.get("margin", "0"),
+                    "mgnMode": record.get("mgnMode", ""),
+                    "notionalUsd": record.get("notionalUsd", "0"),
+                    "uTime": record.get("uTime", ""),
+                })
+            await r.set(key, json.dumps(positions))
+        except Exception as e:
+            self.logger.debug("Failed to store position: %s", e)
+
+    async def _update_position_mark_price(self, symbol: str, last_px: str) -> None:
+        """Update mark price and UPL for positions matching this symbol."""
+        try:
+            r = self.redis.client
+            key = f"account:{self.acct_id}:positions"
+            raw = await r.get(key)
+            if not raw:
+                return
+            positions = json.loads(raw)
+            changed = False
+            for p in positions:
+                if p["instId"] == symbol:
+                    p["markPx"] = last_px
+                    avg = float(p.get("avgPx", 0))
+                    pos = float(p.get("pos", 0))
+                    mark = float(last_px)
+                    if avg > 0 and pos != 0:
+                        upl = (mark - avg) * pos
+                        p["upl"] = str(upl)
+                        p["uplRatio"] = str(upl / (avg * abs(pos))) if avg * abs(pos) != 0 else "0"
+                    changed = True
+            if changed:
+                await r.set(key, json.dumps(positions))
+        except Exception:
+            pass
+
+    async def _sync_account_info(self) -> None:
+        """Fetch account config, trading balance, and funding balance on startup."""
+        try:
+            r = self.redis.client
+            acct_id = self.acct_id
+
+            config_resp = await self._rest_request("GET", "/api/v5/account/config")
+            if config_resp and config_resp.get("code") == "0" and config_resp["data"]:
+                cfg = config_resp["data"][0]
+                level_map = {"1": "cash", "2": "single_ccy_margin",
+                             "3": "multi_ccy_margin", "4": "portfolio_margin"}
+                acct_config = {
+                    "acct_id": acct_id,
+                    "acct_level": cfg.get("acctLv", ""),
+                    "acct_level_name": level_map.get(cfg.get("acctLv", ""), "unknown"),
+                    "pos_mode": cfg.get("posMode", ""),
+                    "uid": cfg.get("uid", ""),
+                }
+                await r.set(f"account:{acct_id}:config", json.dumps(acct_config))
+
+            balance_resp = await self._rest_request("GET", "/api/v5/account/balance")
+            if balance_resp and balance_resp.get("code") == "0" and balance_resp["data"]:
+                await self._store_trading_account(balance_resp["data"][0])
+
+            funding_resp = await self._rest_request("GET", "/api/v5/asset/balances")
+            if funding_resp and funding_resp.get("code") == "0":
+                funding = []
+                for item in funding_resp.get("data", []):
+                    bal = float(item.get("bal", 0))
+                    if bal > 0:
+                        funding.append({
+                            "ccy": item.get("ccy", ""),
+                            "bal": item.get("bal", "0"),
+                            "availBal": item.get("availBal", "0"),
+                            "frozenBal": item.get("frozenBal", "0"),
+                        })
+                await r.set(f"account:{acct_id}:funding", json.dumps(funding))
+
+            earn_resp = await self._rest_request("GET", "/api/v5/finance/savings/balance")
+            if earn_resp and earn_resp.get("code") == "0":
+                earning = []
+                for item in earn_resp.get("data", []):
+                    amt = float(item.get("amt", 0))
+                    if amt > 0:
+                        earning.append({
+                            "ccy": item.get("ccy", ""),
+                            "amt": item.get("amt", "0"),
+                            "earnings": item.get("earnings", "0"),
+                            "rate": item.get("rate", "0"),
+                        })
+                await r.set(f"account:{acct_id}:earning", json.dumps(earning))
+
+            pos_resp = await self._rest_request("GET", "/api/v5/account/positions")
+            if pos_resp and pos_resp.get("code") == "0":
+                positions = []
+                for p in pos_resp.get("data", []):
+                    if float(p.get("pos", 0)) != 0:
+                        positions.append({
+                            "instId": p.get("instId", ""),
+                            "posSide": p.get("posSide", "net"),
+                            "pos": p.get("pos", "0"),
+                            "avgPx": p.get("avgPx", "0"),
+                            "upl": p.get("upl", "0"),
+                            "uplRatio": p.get("uplRatio", "0"),
+                            "lever": p.get("lever", "0"),
+                            "liqPx": p.get("liqPx", ""),
+                            "markPx": p.get("markPx", "0"),
+                            "margin": p.get("margin", "0"),
+                            "mgnMode": p.get("mgnMode", ""),
+                            "notionalUsd": p.get("notionalUsd", "0"),
+                            "uTime": p.get("uTime", ""),
+                        })
+                await r.set(f"account:{acct_id}:positions", json.dumps(positions))
+
+            await r.hset("accounts", acct_id, json.dumps({
+                "acct_id": acct_id,
+                "exchange": "OKX",
+                "mode": "DEMO" if self.simulated else "LIVE",
+                "gateway": self.gateway_name,
+            }))
+            self.logger.info("Synced account info for %s", acct_id)
+        except Exception as e:
+            self.logger.error("Failed to sync account info: %s", e)
+
+    async def _store_trading_account(self, data: dict) -> None:
+        """Store trading account snapshot from REST or WS push."""
+        try:
+            r = self.redis.client
+            acct_id = self.acct_id
+            summary = {
+                "acct_id": acct_id,
+                "totalEq": data.get("totalEq", "0"),
+                "adjEq": data.get("adjEq", "0"),
+                "isoEq": data.get("isoEq", "0"),
+                "ordFroz": data.get("ordFroz", "0"),
+                "imr": data.get("imr", "0"),
+                "mmr": data.get("mmr", "0"),
+                "mgnRatio": data.get("mgnRatio", ""),
+                "notionalUsd": data.get("notionalUsd", "0"),
+                "uTime": data.get("uTime", ""),
+            }
+            details = []
+            for d in data.get("details", []):
+                eq = float(d.get("eq", 0) or 0)
+                if eq > 0:
+                    details.append({
+                        "ccy": d.get("ccy", ""),
+                        "eq": d.get("eq", "0"),
+                        "cashBal": d.get("cashBal", "0"),
+                        "availEq": d.get("availEq", "0"),
+                        "frozenBal": d.get("frozenBal", "0"),
+                        "ordFrozen": d.get("ordFrozen", "0"),
+                        "upl": d.get("upl", "0"),
+                        "crossLiab": d.get("crossLiab", "0"),
+                        "eqUsd": d.get("eqUsd", "0"),
+                    })
+            await r.set(f"account:{acct_id}:trading", json.dumps({
+                "summary": summary, "details": details
+            }))
+        except Exception as e:
+            self.logger.debug("Failed to store trading account: %s", e)
+
     async def _sync_pending_orders(self) -> None:
         """On startup, reconcile Redis active orders with OKX actual state."""
         try:
@@ -293,6 +488,12 @@ class OKXGateway(BaseGateway):
                     "timestamp": o.get("uTime", ""),
                 })
             r = self.redis.client
+            raw = await r.get("pending_orders:okx")
+            old_orders = json.loads(raw) if raw else []
+            for old in old_orders:
+                oid = old.get("order_id", "")
+                if oid and oid not in live_ids:
+                    await self._sync_single_order(oid, old.get("symbol", ""))
             await r.set("pending_orders:okx", json.dumps(synced))
             self.logger.info("Synced active orders from OKX: %d live", len(synced))
         except Exception as e:
@@ -306,7 +507,7 @@ class OKXGateway(BaseGateway):
             raw = await r.get(key)
             orders = json.loads(raw) if raw else []
             oid = order_info["order_id"]
-            terminal = {"filled", "canceled", "cancelled"}
+            terminal = {"filled", "canceled", "cancelled", "rejected"}
             orders = [o for o in orders if o["order_id"] != oid]
             if order_info["state"] not in terminal:
                 orders.append(order_info)
@@ -352,6 +553,21 @@ class OKXGateway(BaseGateway):
             return order_id
         else:
             self.logger.error("Order failed: %s", resp)
+            err_msg = ""
+            if resp and resp.get("data"):
+                err_msg = resp["data"][0].get("sMsg", "")
+            await self._update_pending_orders({
+                "order_id": "",
+                "symbol": order["symbol"],
+                "side": order["side"],
+                "order_type": order.get("order_type", "limit"),
+                "price": str(order.get("price", 0)),
+                "quantity": str(order["quantity"]),
+                "filled_qty": "0",
+                "state": "rejected",
+                "comment": err_msg,
+                "timestamp": str(int(time.time() * 1000)),
+            })
             return ""
 
     async def cancel_order(self, order: dict) -> None:
