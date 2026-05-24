@@ -20,6 +20,7 @@ gateways:
     symbols:
       - "BTC-USDT-SWAP"
       - "ETH-USDT-SWAP"
+      - "ETH-USDT-260626"
 
   futu:
     host: "127.0.0.1"
@@ -54,6 +55,22 @@ strategies:
     params:
       lookback: 20
       threshold: 0.02
+
+  eth_basis:
+    class: "strategy.examples.BasisStrategy"
+    gateway: "okx"
+    symbols:
+      - "ETH-USDT-SWAP"
+      - "ETH-USDT-260626"
+    params:
+      futures_symbol: "ETH-USDT-260626"
+      perp_symbol: "ETH-USDT-SWAP"
+      entry_basis_bps: 15.0
+      exit_basis_bps: 5.0
+      max_position: 5.0
+      quote_offset_ticks: 1
+      min_dte_days: 3
+      max_delta_imbalance: 0.5
 
 # Risk limits (per strategy)
 risk:

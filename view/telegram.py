@@ -51,11 +51,14 @@ class TelegramReporter(ProcessBase):
         while self.running:
             try:
                 topic, data = await sub.receive()
+                price    = float(data.get('price', 0) or 0)
+                price_str = f"{price:.4f}" if price else "MKT"
+                strategy  = data.get('strategy', '') or '—'
                 msg = (
-                    f"Fill: {data.get('side', '').upper()} "
+                    f"🔔 Fill: {data.get('side', '').upper()} "
                     f"{data.get('quantity', 0)} {data.get('symbol', '')} "
-                    f"@ {data.get('price', 0):.4f} "
-                    f"[{data.get('strategy', '')}]"
+                    f"@ {price_str} "
+                    f"[{strategy}]"
                 )
                 await self._send_message(msg)
             except Exception as e:
@@ -131,14 +134,51 @@ class TelegramReporter(ProcessBase):
             await self._send_message("\n".join(lines) if heartbeats else "No processes reporting.")
 
         elif text == "/positions":
-            positions = await self.redis.get_all_positions()
-            if positions:
-                lines = ["Open Positions:"]
-                for pos in positions:
-                    lines.append(f"  {pos.get('_key')}: qty={pos.get('quantity')}")
+            snapshots = await self.redis.get_all_pnl_snapshots()
+            open_positions = []
+            for snap in snapshots:
+                strategy = snap.get("strategy", "?")
+                for pos_key, pos in snap.get("positions", {}).items():
+                    if float(pos.get("net_qty", 0)) != 0:
+                        open_positions.append((strategy, pos))
+
+            if open_positions:
+                lines = [f"<b>Open Positions ({len(open_positions)})</b>"]
+                for strategy, pos in open_positions:
+                    qty    = float(pos.get("net_qty", 0))
+                    entry  = float(pos.get("avg_entry_price", 0))
+                    last   = float(pos.get("last_price", 0))
+                    unreal = float(pos.get("unrealized_pnl", 0))
+                    real   = float(pos.get("realized_pnl", 0))
+                    fees   = float(pos.get("total_fees", 0))
+                    side   = "LONG" if qty > 0 else "SHORT"
+                    lines.append(
+                        f"\n<b>{pos.get('symbol')} [{pos.get('gateway')}]</b> — {strategy}\n"
+                        f"  {side} {abs(qty):.6g}  Entry: {entry:.6g}  Last: {last:.6g}\n"
+                        f"  Unreal: {unreal:+.4f}  Real: {real:+.4f}  Fees: {fees:.4f}"
+                    )
                 await self._send_message("\n".join(lines))
             else:
-                await self._send_message("No open positions.")
+                # Fall back to live exchange positions from gateway account data
+                acct_positions = await self.redis.get_account_positions()
+                if acct_positions:
+                    lines = [f"<b>Open Positions ({len(acct_positions)}) — exchange</b>"]
+                    for pos in acct_positions:
+                        qty    = float(pos.get("pos", 0))
+                        entry  = float(pos.get("avgPx", 0))
+                        last   = float(pos.get("markPx", 0))
+                        unreal = float(pos.get("upl", 0))
+                        symbol = pos.get("instId", "?")
+                        gw     = pos.get("_gateway", "?")
+                        side   = "LONG" if qty > 0 else "SHORT"
+                        lines.append(
+                            f"\n<b>{symbol} [{gw}]</b>\n"
+                            f"  {side} {abs(qty):.6g}  Entry: {entry:.6g}  Last: {last:.6g}\n"
+                            f"  Unreal: {unreal:+.4f}"
+                        )
+                    await self._send_message("\n".join(lines))
+                else:
+                    await self._send_message("No open positions.")
 
         elif text == "/stop":
             # Signal all strategies to stop via Redis
@@ -149,9 +189,69 @@ class TelegramReporter(ProcessBase):
             await self._send_message("All strategies disabled.")
 
         elif text == "/pnl":
-            # Fetch latest PnL snapshots
-            # This is simplified — a full implementation would aggregate
-            await self._send_message("PnL query not yet implemented.")
+            snapshots = await self.redis.get_all_pnl_snapshots()
+            if not snapshots:
+                # Fall back to exchange account positions
+                acct_positions = await self.redis.get_account_positions()
+                if not acct_positions:
+                    await self._send_message("No PnL data yet.")
+                    return
+                total_unreal = sum(float(p.get("upl", 0)) for p in acct_positions)
+                lines = ["<b>PnL Summary — exchange positions</b>"]
+                for pos in acct_positions:
+                    qty    = float(pos.get("pos", 0))
+                    entry  = float(pos.get("avgPx", 0))
+                    last   = float(pos.get("markPx", 0))
+                    unreal = float(pos.get("upl", 0))
+                    symbol = pos.get("instId", "?")
+                    gw     = pos.get("_gateway", "?")
+                    side   = "LONG" if qty > 0 else "SHORT"
+                    lines.append(
+                        f"\n<b>{symbol} [{gw}]</b>\n"
+                        f"  {side} {abs(qty):.6g}  Entry: {entry:.6g}  Last: {last:.6g}\n"
+                        f"  Unrealized: {unreal:+.4f}"
+                    )
+                if len(acct_positions) > 1:
+                    lines.append(f"\n<b>Total Unrealized: {total_unreal:+.4f}</b>")
+                await self._send_message("\n".join(lines))
+                return
+
+            import datetime
+            lines = ["<b>PnL Summary</b>"]
+            total_realized = total_unrealized = total_fees = 0.0
+            for snap in snapshots:
+                strategy    = snap.get("strategy", "?")
+                realized    = float(snap.get("realized_pnl", 0))
+                unrealized  = float(snap.get("unrealized_pnl", 0))
+                total       = float(snap.get("total_pnl", 0))
+                fees        = float(snap.get("total_fees", 0))
+                net_delta   = float(snap.get("net_delta", 0))
+                ts          = snap.get("timestamp", 0)
+                updated     = datetime.datetime.fromtimestamp(ts).strftime("%H:%M:%S") if ts else "—"
+
+                total_realized   += realized
+                total_unrealized += unrealized
+                total_fees       += fees
+
+                lines.append(
+                    f"\n<b>{strategy}</b>\n"
+                    f"  Realized:   {realized:+.4f}\n"
+                    f"  Unrealized: {unrealized:+.4f}\n"
+                    f"  Total:      {total:+.4f}\n"
+                    f"  Fees:       {fees:.4f}\n"
+                    f"  Net Δ:      {net_delta:+.2f}\n"
+                    f"  Updated:    {updated}"
+                )
+
+            if len(snapshots) > 1:
+                lines.append(
+                    f"\n<b>All strategies</b>\n"
+                    f"  Realized:   {total_realized:+.4f}\n"
+                    f"  Unrealized: {total_unrealized:+.4f}\n"
+                    f"  Total:      {total_realized + total_unrealized:+.4f}\n"
+                    f"  Fees:       {total_fees:.4f}"
+                )
+            await self._send_message("\n".join(lines))
 
     async def _send_message(self, text: str) -> None:
         if not self._session:

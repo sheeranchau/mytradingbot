@@ -94,6 +94,71 @@ class RedisStore:
         key = f"pnl:{strategy}"
         return await self.client.xrange(key, "-", "+", count=count)
 
+    async def get_all_pnl_snapshots(self) -> list[dict]:
+        """Return the latest PnL snapshot for every strategy (written by risk engine)."""
+        keys = await self.client.keys("pnl:*")
+        snapshots = []
+        for key in keys:
+            raw = await self.client.get(key)
+            if raw:
+                try:
+                    snapshots.append(json.loads(raw))
+                except (json.JSONDecodeError, TypeError):
+                    pass
+        return snapshots
+
+    async def get_account_positions(self) -> list[dict]:
+        """Return raw exchange positions from all account:*:positions keys.
+
+        Each entry is the raw dict the gateway wrote, augmented with a
+        '_gateway' field derived from the key name.
+        """
+        keys = await self.client.keys("account:*:positions")
+        positions = []
+        for key in keys:
+            raw = await self.client.get(key)
+            if not raw:
+                continue
+            try:
+                entries = json.loads(raw)
+                # key format: account:{gateway_name}:positions
+                gateway = key.split(":")[1] if key.count(":") >= 2 else key
+                for entry in entries:
+                    if float(entry.get("pos", 0)) != 0:
+                        entry["_gateway"] = gateway
+                        positions.append(entry)
+            except (json.JSONDecodeError, TypeError, ValueError):
+                pass
+        return positions
+
+    # --- Order history ---
+
+    async def get_order_updates(self, gateway: str = "okx",
+                                count: int = 200,
+                                start: str = "-", end: str = "+") -> list[dict]:
+        """Full audit log — every state change for every order (open, partial, filled…)."""
+        key = f"order_updates:{gateway}"
+        entries = await self.client.xrange(key, start, end, count=count)
+        return [{"_stream_id": e[0], **e[1]} for e in entries]
+
+    async def get_finished_orders(self, gateway: str = "okx",
+                                  count: int = 100) -> list[dict]:
+        """Terminal orders only (filled / cancelled / rejected)."""
+        entries = await self.client.xrange("finished_orders", "-", "+", count=count)
+        return [{"_stream_id": e[0], **e[1]} for e in entries]
+
+    async def get_fills(self, gateway: str = "okx",
+                        count: int = 200) -> list[dict]:
+        """Individual executions — each entry has a unique fill_id."""
+        key = f"fills:{gateway}"
+        entries = await self.client.xrange(key, "-", "+", count=count)
+        return [{"_stream_id": e[0], **e[1]} for e in entries]
+
+    async def get_pending_orders(self, gateway: str = "okx") -> list[dict]:
+        """Live snapshot of non-terminal orders."""
+        raw = await self.client.get(f"pending_orders:{gateway}")
+        return json.loads(raw) if raw else []
+
     # --- Heartbeat tracking ---
     async def set_heartbeat(self, process_name: str, info: dict) -> None:
         key = f"heartbeat:{process_name}"

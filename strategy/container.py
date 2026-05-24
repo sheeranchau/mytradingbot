@@ -13,6 +13,25 @@ from core.zmq_channels import (
     SIGNAL_PORT, RISK_KILL_PORT, GATEWAY_MARKET_DATA_PORTS,
 )
 from core.events import EventType
+
+async def _call(fn, *args):
+    """Call fn(*args), awaiting the result if it is a coroutine.
+
+    Strategies may override any callback as sync or async.
+    For fire-and-forget callbacks (on_fill, on_order_update) use this.
+    For callbacks whose return value matters use _call_ret.
+    """
+    result = fn(*args)
+    if asyncio.iscoroutine(result):
+        await result
+
+
+async def _call_ret(fn, *args):
+    """Like _call but returns the value (or awaits and returns for async)."""
+    result = fn(*args)
+    if asyncio.iscoroutine(result):
+        return await result
+    return result
 from core.logger import get_logger
 from strategy.base import BaseStrategy
 
@@ -45,7 +64,11 @@ class StrategyContainer(ProcessBase):
 
     async def run(self) -> None:
         market_sub = MultiSubscriber(GATEWAY_MARKET_DATA_PORTS,
-                                     topics=["tick.", "orderbook.", "fill."])
+                                     topics=["tick.", "orderbook.", "fill.",
+                                             "order_update.", "funding_rate."])
+        # Assign _signal_push before any coroutine yields so strategies that
+        # call place_order() from on_tick() during the first message burst
+        # never see a None pusher.
         self._signal_push = Pusher(SIGNAL_PORT, bind=False)
         kill_sub = Subscriber(RISK_KILL_PORT, topics=["risk."])
 
@@ -71,8 +94,8 @@ class StrategyContainer(ProcessBase):
     # ── Market data dispatch ─────────────────────────────────────────────
 
     async def _dispatch(self, topic: str, data: dict) -> None:
-        gateway = data.get("gateway", "")
-        symbol = data.get("symbol", "")
+        gateway    = data.get("gateway", "")
+        symbol     = data.get("symbol", "")
         event_type = data.get("event_type", "")
 
         if event_type == EventType.TICK:
@@ -82,9 +105,25 @@ class StrategyContainer(ProcessBase):
                 "last": data.get("last", 0),
                 "timestamp": data.get("timestamp", 0),
             }
-
-        if event_type == EventType.ORDERBOOK:
+        elif event_type == EventType.ORDERBOOK:
             self._depth_cache[f"{gateway}:{symbol}"] = data
+
+        # Fill and order-update events are strategy-addressed — route by name,
+        # not by (gateway, symbol), so they reach the right strategy even when
+        # the symbol isn't in that strategy's subscription list.
+        data_strategy = data.get("strategy", "")
+        if event_type in (EventType.FILL, EventType.ORDER_UPDATE):
+            if data_strategy and data_strategy in self.strategies:
+                strategy = self.strategies[data_strategy]
+                if strategy.enabled:
+                    if event_type == EventType.FILL:
+                        self.logger.info("Fill: %s %s %s @ %s",
+                                         data_strategy, data.get("side"),
+                                         symbol, data.get("price"))
+                        await _call(strategy.on_fill, data)
+                    else:
+                        await _call(strategy.on_order_update, data)
+            return
 
         key = (gateway, symbol)
         strategy_names = self._routes.get(key, [])
@@ -94,24 +133,18 @@ class StrategyContainer(ProcessBase):
             if not strategy.enabled:
                 continue
 
-            enabled = await self.redis.is_strategy_enabled(name)
-            if not enabled:
-                strategy.enabled = False
-                continue
-
             signal = None
             if event_type == EventType.TICK:
                 strategy._tick_count += 1
-                signal = strategy.on_tick(symbol, data)
+                strategy._latest_ticks[symbol] = data
+                signal = await _call_ret(strategy.on_tick, symbol, data)
             elif event_type == EventType.ORDERBOOK:
-                signal = strategy.on_depth(symbol, data)
+                strategy._latest_books[symbol] = data
+                signal = await _call_ret(strategy.on_depth, symbol, data)
                 if signal is None:
-                    signal = strategy.on_orderbook(symbol, data)
-            elif event_type == EventType.FILL:
-                if data.get("strategy") == name:
-                    strategy.on_fill(data)
-                    self.logger.info("Fill received: %s %s %s @ %s",
-                                     name, data.get("side"), symbol, data.get("price"))
+                    signal = await _call_ret(strategy.on_orderbook, symbol, data)
+            elif event_type == EventType.FUNDING_RATE:
+                await _call(strategy.on_funding_rate, data)
 
             if signal:
                 await self._emit_signal(name, gateway, symbol, signal)
@@ -137,6 +170,9 @@ class StrategyContainer(ProcessBase):
     async def strategy_place_order(self, strategy_name: str, gateway: str,
                                    symbol: str, side: str, price: float,
                                    quantity: float, order_type: str = "limit") -> None:
+        if not self._signal_push:
+            self.logger.error("Signal push not ready — order dropped for %s", strategy_name)
+            return
         order = {
             "event_type": EventType.ORDER_NEW,
             "strategy": strategy_name,
@@ -152,6 +188,9 @@ class StrategyContainer(ProcessBase):
 
     async def strategy_cancel_order(self, strategy_name: str, gateway: str,
                                     order_id: str, symbol: str) -> None:
+        if not self._signal_push:
+            self.logger.error("Signal push not ready — cancel dropped for %s", strategy_name)
+            return
         order = {
             "event_type": EventType.ORDER_CANCEL,
             "strategy": strategy_name,
@@ -166,6 +205,9 @@ class StrategyContainer(ProcessBase):
                                    order_id: str, symbol: str,
                                    new_price: float = None,
                                    new_qty: float = None) -> None:
+        if not self._signal_push:
+            self.logger.error("Signal push not ready — amend dropped for %s", strategy_name)
+            return
         order = {
             "event_type": EventType.ORDER_AMEND,
             "strategy": strategy_name,
@@ -180,24 +222,60 @@ class StrategyContainer(ProcessBase):
             order["quantity"] = new_qty
         await self._signal_push.push(order)
 
+    async def _find_acct_key(self, gateway: str, suffix: str) -> str:
+        """Return the most-recently-updated ``account:*:{suffix}`` key for a
+        gateway, scanning the ``accounts`` Redis hash the gateways register to.
+
+        Falls back to the legacy ``{gateway}_demo`` → ``{gateway}_live``
+        pattern if the hash is absent or has no matching entry.
+        """
+        try:
+            r = self.redis.client
+            # The gateways write their acct_id into an 'accounts' hash on start.
+            accounts_raw = await r.hgetall("accounts")
+            best_key = None
+            best_ts  = -1
+            for acct_id, meta_raw in accounts_raw.items():
+                if not acct_id.startswith(gateway):
+                    continue
+                candidate = f"account:{acct_id}:{suffix}"
+                # Pick the entry with the most-recent update timestamp.
+                try:
+                    meta = json.loads(meta_raw)
+                    ts   = float(meta.get("update_time_ms", 0) or 0)
+                except Exception:
+                    ts = 0
+                if ts > best_ts:
+                    exists = await r.exists(candidate)
+                    if exists:
+                        best_ts  = ts
+                        best_key = candidate
+            if best_key:
+                return best_key
+        except Exception:
+            pass
+        # Fallback: try demo then live
+        for mode in ("demo", "live"):
+            key = f"account:{gateway}_{mode}:{suffix}"
+            try:
+                if await self.redis.client.exists(key):
+                    return key
+            except Exception:
+                pass
+        return f"account:{gateway}_demo:{suffix}"
+
     async def strategy_get_positions(self, gateway: str) -> list[dict]:
         try:
-            acct_id = f"{gateway}_demo"
-            raw = await self.redis.client.get(f"account:{acct_id}:positions")
-            if not raw:
-                acct_id = f"{gateway}_live"
-                raw = await self.redis.client.get(f"account:{acct_id}:positions")
+            key = await self._find_acct_key(gateway, "positions")
+            raw = await self.redis.client.get(key)
             return json.loads(raw) if raw else []
         except Exception:
             return []
 
     async def strategy_get_balance(self, gateway: str) -> dict:
         try:
-            acct_id = f"{gateway}_demo"
-            raw = await self.redis.client.get(f"account:{acct_id}:trading")
-            if not raw:
-                acct_id = f"{gateway}_live"
-                raw = await self.redis.client.get(f"account:{acct_id}:trading")
+            key = await self._find_acct_key(gateway, "trading")
+            raw = await self.redis.client.get(key)
             return json.loads(raw) if raw else {}
         except Exception:
             return {}
@@ -205,6 +283,29 @@ class StrategyContainer(ProcessBase):
     def strategy_get_depth(self, gateway: str, symbol: str) -> dict:
         return self._depth_cache.get(f"{gateway}:{symbol}",
                                      {"bids": [], "asks": []})
+
+    async def strategy_get_instrument(self, gateway: str, symbol: str) -> dict:
+        try:
+            raw = await self.redis.client.get(f"instruments:{gateway}")
+            if raw:
+                return json.loads(raw).get(symbol, {})
+        except Exception:
+            pass
+        return {}
+
+    async def strategy_get_instruments(self, gateway: str) -> dict:
+        try:
+            raw = await self.redis.client.get(f"instruments:{gateway}")
+            return json.loads(raw) if raw else {}
+        except Exception:
+            return {}
+
+    async def strategy_get_fee_rates(self, gateway: str) -> dict:
+        try:
+            raw = await self.redis.client.get(f"fees:{gateway}")
+            return json.loads(raw) if raw else {}
+        except Exception:
+            return {}
 
     # ── Periodic task runner ─────────────────────────────────────────────
 
@@ -282,9 +383,11 @@ class StrategyContainer(ProcessBase):
             self.logger.info("Strategy '%s' enabled", strategy_name)
 
         elif action == "disable" and strategy_name in self.strategies:
-            self.strategies[strategy_name].enabled = False
+            strategy = self.strategies[strategy_name]
+            strategy.enabled = False
             await self.redis.set_strategy_enabled(strategy_name, False)
-            self.logger.info("Strategy '%s' disabled", strategy_name)
+            await _call(strategy.on_pause)
+            self.logger.info("Strategy '%s' disabled (on_pause called)", strategy_name)
 
     # ── Kill signal handling ─────────────────────────────────────────────
 
@@ -297,12 +400,15 @@ class StrategyContainer(ProcessBase):
 
                 if target:
                     if target in self.strategies:
-                        self.strategies[target].enabled = False
-                        self.logger.warning("Strategy '%s' killed: %s", target, reason)
+                        strategy = self.strategies[target]
+                        strategy.enabled = False
+                        await _call(strategy.on_stop)
+                        self.logger.warning("Strategy '%s' killed: %s (on_stop called)", target, reason)
                 else:
                     for s in self.strategies.values():
                         s.enabled = False
-                    self.logger.critical("ALL strategies killed: %s", reason)
+                        await _call(s.on_stop)
+                    self.logger.critical("ALL strategies killed: %s (on_stop called)", reason)
             except Exception as e:
                 self.logger.error("Kill listener error: %s", e)
                 await asyncio.sleep(1)

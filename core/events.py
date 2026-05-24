@@ -14,13 +14,15 @@ class EventType(str, Enum):
     TICK = "tick"
     ORDERBOOK = "orderbook"
     KLINE = "kline"
+    FUNDING_RATE = "funding_rate"
 
     # Trading
     SIGNAL = "signal"
     ORDER_NEW = "order_new"
+    ORDER_UPDATE = "order_update"   # lifecycle change: open / partial / filled / cancelled
     ORDER_CANCEL = "order_cancel"
     ORDER_AMEND = "order_amend"
-    FILL = "fill"
+    FILL = "fill"                   # individual execution (fill_id populated)
 
     # Position & account
     POSITION = "position"
@@ -110,6 +112,7 @@ class SignalEvent(Event):
 @dataclass
 class OrderEvent(Event):
     event_type: str = EventType.ORDER_NEW
+    client_order_id: str = ""
     order_id: str = ""
     strategy: str = ""
     gateway: str = ""
@@ -121,16 +124,44 @@ class OrderEvent(Event):
 
 
 @dataclass
-class FillEvent(Event):
-    event_type: str = EventType.FILL
+class OrderUpdateEvent(Event):
+    """Emitted whenever order state changes (open, partial, filled, cancelled…)."""
+    event_type: str = EventType.ORDER_UPDATE
+    client_order_id: str = ""
     order_id: str = ""
     strategy: str = ""
     gateway: str = ""
     symbol: str = ""
+    state: str = ""             # OrderState constant
+    filled_qty: float = 0.0
+    avg_fill_price: float = 0.0
+    remaining_qty: float = 0.0
+    update_time_ms: int = 0
+
+
+@dataclass
+class FillEvent(Event):
+    """Emitted for each individual execution (fill_id is always populated)."""
+    event_type: str = EventType.FILL
+    # Identity
+    client_order_id: str = ""
+    order_id: str = ""
+    fill_id: str = ""           # unique per execution
+    strategy: str = ""
+    gateway: str = ""
+    symbol: str = ""
     side: str = ""
-    price: float = 0.0
-    quantity: float = 0.0
-    commission: float = 0.0
+    # Fill details
+    price: float = 0.0          # execution price of this fill
+    quantity: float = 0.0       # quantity executed in this fill
+    commission: float = 0.0     # fee (kept for backward compat; mirrors fill_fee)
+    fill_fee: float = 0.0       # fee (negative = cost, positive = rebate)
+    fill_fee_ccy: str = ""      # fee currency
+    fill_pnl: float = 0.0       # realised PnL (reduce-only legs)
+    fill_time_ms: int = 0       # fill timestamp ms
+    # Running totals at time of this fill
+    filled_qty: float = 0.0     # cumulative filled qty after this fill
+    avg_fill_price: float = 0.0 # VWAP after this fill
 
 
 @dataclass

@@ -8,11 +8,26 @@ import hmac
 import base64
 import time
 import json
+from dataclasses import asdict
 from typing import Optional
 
 import aiohttp
 
 from gateway.base import BaseGateway
+from core.models import OrderUpdate, OrderState
+
+
+# ── OKX state → normalised OrderState ────────────────────────────────────────
+_OKX_STATE: dict[str, str] = {
+    "live":             OrderState.OPEN,
+    "partially_filled": OrderState.PARTIAL,
+    "filled":           OrderState.FILLED,
+    "canceled":         OrderState.CANCELLED,
+    "cancelled":        OrderState.CANCELLED,
+    "mmp_canceled":     OrderState.CANCELLED,
+    "rejected":         OrderState.REJECTED,
+    "expired":          OrderState.EXPIRED,
+}
 
 
 class OKXGateway(BaseGateway):
@@ -56,6 +71,14 @@ class OKXGateway(BaseGateway):
         self._ws_public: Optional[aiohttp.ClientWebSocketResponse] = None
         self._ws_private: Optional[aiohttp.ClientWebSocketResponse] = None
         self._session: Optional[aiohttp.ClientSession] = None
+        # In-memory map: clOrdId → ordId (populated once exchange ACKs the order)
+        # Used to correlate REST sync responses back to our client_order_id
+        self._cl_to_ord: dict[str, str] = {}
+        # Reverse map: ordId → clOrdId (for WS pushes that only carry ordId)
+        self._ord_to_cl: dict[str, str] = {}
+        # clOrdId → strategy name — OKX WS never sends the strategy field so
+        # we record it at send_order time and look it up on every WS fill push.
+        self._cl_to_strategy: dict[str, str] = {}
 
     def _has_credentials(self) -> bool:
         # Treat unresolved YAML placeholders (e.g. "${OKX_API_KEY}") as missing
@@ -74,6 +97,10 @@ class OKXGateway(BaseGateway):
         self._ws_public = await self._session.ws_connect(self.WS_PUBLIC)
         self.logger.info("Public WS connected")
 
+        # Instruments are a public endpoint — fetch before auth check so
+        # market-data-only mode still has instrument metadata available.
+        await self._fetch_and_store_instruments()
+
         if self._has_credentials():
             # Connect and authenticate private websocket for order/fill streams
             self.logger.info("Connecting private WS: %s", self.WS_PRIVATE)
@@ -84,6 +111,8 @@ class OKXGateway(BaseGateway):
             await self._subscribe_private()
             await self._sync_pending_orders()
             await self._sync_account_info()
+            await self._fetch_fee_rates()
+            asyncio.create_task(self._cod_keepalive_loop())
         else:
             self.logger.info("No API credentials — running in market-data-only mode")
 
@@ -126,11 +155,14 @@ class OKXGateway(BaseGateway):
         for symbol in self.symbols:
             args.append({"channel": "tickers", "instId": symbol})
             args.append({"channel": "books", "instId": symbol})
+            if symbol.endswith("-SWAP"):
+                args.append({"channel": "funding-rate", "instId": symbol})
         await self._ws_public.send_json({"op": "subscribe", "args": args})
 
         # Listen and publish (private task only when credentials were provided)
         if self._has_credentials():
             asyncio.create_task(self._listen_private())
+        asyncio.create_task(self._refresh_instruments_loop())
 
         while self.running:
             try:
@@ -235,6 +267,15 @@ class OKXGateway(BaseGateway):
                     "timestamp": time.time(),
                 })
 
+            elif channel == "funding-rate":
+                await self.publish_funding_rate(symbol, {
+                    "funding_rate": float(record.get("fundingRate", 0) or 0),
+                    "next_funding_rate": float(record.get("nextFundingRate", 0) or 0),
+                    "funding_time": int(record.get("fundingTime", 0) or 0),
+                    "next_funding_time": int(record.get("nextFundingTime", 0) or 0),
+                    "timestamp": time.time(),
+                })
+
     async def _listen_private(self) -> None:
         """Listen for fills and position updates from private WS."""
         while self.running:
@@ -249,6 +290,101 @@ class OKXGateway(BaseGateway):
                 self.logger.error("Private WS error: %s", e)
                 await asyncio.sleep(1)
 
+    def _build_order_update_from_ws(self, record: dict) -> OrderUpdate:
+        """Map a single OKX orders-channel WS record to an OrderUpdate."""
+        ord_id    = record.get("ordId", "")
+        cl_id     = record.get("clOrdId", "") or self._ord_to_cl.get(ord_id, "")
+        raw_state = record.get("state", "")
+
+        # Recover strategy — OKX WS never sends it, so look up from the map
+        # populated at send_order time (survives restart via Redis seed).
+        strategy = self._cl_to_strategy.get(cl_id, "")
+
+        # Per-fill fields — only present when fillSz > 0
+        fill_sz  = float(record.get("fillSz", 0) or 0)
+        fill_id  = record.get("fillId", "") if fill_sz > 0 else ""
+
+        # OKX sometimes sends a terminal state=filled push with fillSz=0 / no
+        # fillId (the per-fill detail was in an earlier push, or OKX batched it).
+        # When that happens synthesize a fill from the aggregate accFillSz + avgPx
+        # so the risk engine and Telegram are always notified.  We use the ordId
+        # as the synthetic fill_id — the fill_lock NX guard in
+        # _process_order_update will de-duplicate if a real fill push arrived first.
+        filled_qty = float(record.get("accFillSz", 0) or 0)
+        avg_px     = float(record.get("avgPx", 0) or 0)
+        if not fill_id and raw_state == "filled" and filled_qty > 0 and avg_px > 0:
+            fill_id    = f"syn{ord_id}"   # synthetic — prefixed to avoid clash with real fillIds
+            fill_sz    = filled_qty
+            avg_px     = avg_px           # use aggregate avg as fill price
+
+        # fillFee is per-fill; fee is cumulative. Prefer fillFee, fall back to
+        # fee (negated — OKX sends fees as negative numbers) for older API versions.
+        if fill_id:
+            raw_fee  = record.get("fillFee") or record.get("fee", 0)
+            fill_fee = abs(float(raw_fee or 0))
+        else:
+            fill_fee = 0.0
+
+        fill_price = float(record.get("fillPx", 0) or 0) if fill_id else 0.0
+        # For synthetic fills, fillPx is absent — use avgPx instead
+        if fill_id and fill_price == 0.0:
+            fill_price = avg_px
+
+        return OrderUpdate(
+            client_order_id = cl_id,
+            order_id        = ord_id,
+            gateway         = self.gateway_name,
+            strategy        = strategy,
+            symbol          = record.get("instId", ""),
+            side            = record.get("side", ""),
+            order_type      = record.get("ordType", "limit"),
+            price           = float(record.get("px", 0) or 0),
+            quantity        = float(record.get("sz", 0) or 0),
+            state           = _OKX_STATE.get(raw_state, raw_state),
+            filled_qty      = filled_qty,
+            avg_fill_price  = avg_px,
+            # Fill-level fields
+            fill_id         = fill_id,
+            fill_price      = fill_price,
+            fill_qty        = fill_sz if fill_id else 0.0,
+            fill_fee        = fill_fee,
+            fill_fee_ccy    = record.get("fillFeeCcy", "") if fill_id else "",
+            fill_pnl        = float(record.get("pnl", 0) or 0) if fill_id else 0.0,
+            fill_time_ms    = int(record.get("fillTime", 0) or 0) if fill_id else 0,
+            create_time_ms  = int(record.get("cTime", 0) or 0),
+            update_time_ms  = int(record.get("uTime", 0) or 0),
+            update_source   = "ws",
+        )
+
+    def _build_order_update_from_rest(self, record: dict, *,
+                                      cl_ord_id: str = "") -> OrderUpdate:
+        """Map an OKX REST order record to an OrderUpdate.
+        REST does not carry per-fill fields; those come only via WS.
+        """
+        ord_id    = record.get("ordId", "")
+        cl_id     = record.get("clOrdId", "") or cl_ord_id or self._ord_to_cl.get(ord_id, "")
+        raw_state = record.get("state", "")
+        # Recover strategy the same way as the WS builder.
+        strategy  = self._cl_to_strategy.get(cl_id, "")
+
+        return OrderUpdate(
+            client_order_id = cl_id,
+            order_id        = ord_id,
+            gateway         = self.gateway_name,
+            strategy        = strategy,
+            symbol          = record.get("instId", ""),
+            side            = record.get("side", ""),
+            order_type      = record.get("ordType", "limit"),
+            price           = float(record.get("px", 0) or 0),
+            quantity        = float(record.get("sz", 0) or 0),
+            state           = _OKX_STATE.get(raw_state, raw_state),
+            filled_qty      = float(record.get("accFillSz", 0) or 0),
+            avg_fill_price  = float(record.get("avgPx", 0) or 0),
+            create_time_ms  = int(record.get("cTime", 0) or 0),
+            update_time_ms  = int(record.get("uTime", 0) or 0),
+            update_source   = "rest",
+        )
+
     async def _handle_private_msg(self, data: dict) -> None:
         arg = data.get("arg", {})
         channel = arg.get("channel", "")
@@ -256,31 +392,12 @@ class OKXGateway(BaseGateway):
 
         for record in records:
             if channel == "orders":
-                state = record.get("state", "")
-                order_info = {
-                    "order_id": record.get("ordId", ""),
-                    "symbol": record.get("instId", ""),
-                    "side": record.get("side", ""),
-                    "order_type": record.get("ordType", ""),
-                    "price": record.get("px", "0"),
-                    "quantity": record.get("sz", "0"),
-                    "filled_qty": record.get("accFillSz", "0"),
-                    "avg_price": record.get("avgPx", "0"),
-                    "state": state,
-                    "timestamp": record.get("uTime", ""),
-                }
-                await self._update_pending_orders(order_info)
-
-                if state == "filled":
-                    await self.publish_fill({
-                        "order_id": record.get("ordId", ""),
-                        "symbol": record.get("instId", ""),
-                        "side": "buy" if record.get("side") == "buy" else "sell",
-                        "price": float(record.get("avgPx", 0)),
-                        "quantity": float(record.get("fillSz", 0)),
-                        "commission": float(record.get("fee", 0)),
-                        "timestamp": time.time(),
-                    })
+                update = self._build_order_update_from_ws(record)
+                # Keep id-maps in sync
+                if update.order_id and update.client_order_id:
+                    self._cl_to_ord[update.client_order_id] = update.order_id
+                    self._ord_to_cl[update.order_id] = update.client_order_id
+                await self._process_order_update(update)
 
             elif channel == "account":
                 await self._store_trading_account(record)
@@ -469,156 +586,209 @@ class OKXGateway(BaseGateway):
             self.logger.debug("Failed to store trading account: %s", e)
 
     async def _sync_pending_orders(self) -> None:
-        """On startup, reconcile Redis active orders with OKX actual state."""
+        """On startup, reconcile Redis active orders with OKX actual state.
+
+        Three things happen here:
+        1. Rebuild ``_cl_to_ord`` / ``_ord_to_cl`` maps from Redis data first
+           (covers orders that were pending before restart even if they are now
+           terminal — needed before any _sync_single_order calls below).
+        2. Fetch live orders from OKX and rebuild the pending list.
+        3. Any order tracked in Redis but no longer live on exchange is synced
+           via REST to get its terminal state written to finished_orders.
+        """
         try:
-            live_orders = await self.query_pending_orders()
-            live_ids = {o.get("ordId", "") for o in live_orders}
-            synced = []
-            for o in live_orders:
-                synced.append({
-                    "order_id": o.get("ordId", ""),
-                    "symbol": o.get("instId", ""),
-                    "side": o.get("side", ""),
-                    "order_type": o.get("ordType", ""),
-                    "price": o.get("px", "0"),
-                    "quantity": o.get("sz", "0"),
-                    "filled_qty": o.get("accFillSz", "0"),
-                    "avg_price": o.get("avgPx", "0"),
-                    "state": o.get("state", "live"),
-                    "timestamp": o.get("uTime", ""),
-                })
             r = self.redis.client
             raw = await r.get("pending_orders:okx")
             old_orders = json.loads(raw) if raw else []
+
+            # 1. Rebuild maps from Redis first — ensures _sync_single_order below
+            #    can resolve cl_id even if the order is no longer on the exchange.
             for old in old_orders:
-                oid = old.get("order_id", "")
+                oid      = old.get("order_id", "")
+                cl_id    = old.get("client_order_id", "")
+                strategy = old.get("strategy", "")
+                if oid and cl_id:
+                    self._cl_to_ord[cl_id] = oid
+                    self._ord_to_cl[oid]   = cl_id
+                if cl_id and strategy:
+                    self._cl_to_strategy[cl_id] = strategy
+
+            # 2. Fetch live orders from OKX and overwrite maps with fresh data
+            live_orders = await self.query_pending_orders()
+            live_ids = {o.get("ordId", "") for o in live_orders}
+            synced: list[dict] = []
+            for o in live_orders:
+                update = self._build_order_update_from_rest(o)
+                if update.order_id and update.client_order_id:
+                    self._cl_to_ord[update.client_order_id] = update.order_id
+                    self._ord_to_cl[update.order_id] = update.client_order_id
+                synced.append(update.to_redis_dict())
+
+            # 3. Orders tracked in Redis but no longer live → get terminal state
+            for old in old_orders:
+                oid   = old.get("order_id", "")
+                cl_id = old.get("client_order_id", "")
                 if oid and oid not in live_ids:
-                    await self._sync_single_order(oid, old.get("symbol", ""))
+                    await self._sync_single_order(oid, old.get("symbol", ""),
+                                                  cl_ord_id=cl_id)
+
             await r.set("pending_orders:okx", json.dumps(synced))
-            self.logger.info("Synced active orders from OKX: %d live", len(synced))
+            self.logger.info("Startup sync: %d live orders on OKX, %d checked from Redis",
+                             len(synced), len(old_orders))
         except Exception as e:
             self.logger.error("Failed to sync pending orders: %s", e)
 
-    async def _update_pending_orders(self, order_info: dict) -> None:
-        """Track active orders in Redis; log terminal orders to history stream."""
-        try:
-            key = "pending_orders:okx"
-            r = self.redis.client
-            raw = await r.get(key)
-            orders = json.loads(raw) if raw else []
-            oid = order_info["order_id"]
-            terminal = {"filled", "canceled", "cancelled", "rejected"}
-            orders = [o for o in orders if o["order_id"] != oid]
-            if order_info["state"] not in terminal:
-                orders.append(order_info)
-            else:
-                await r.xadd("finished_orders", {
-                    k: str(v) for k, v in order_info.items()
-                }, maxlen=500)
-            await r.set(key, json.dumps(orders))
-        except Exception as e:
-            self.logger.debug("Failed to update pending orders in Redis: %s", e)
-
     async def send_order(self, order: dict) -> str:
-        """Place order via REST API."""
+        """Place order via REST API. Returns exchange ordId, or "" on failure."""
         path = "/api/v5/trade/order"
+
+        # Generate clOrdId and register it before the REST call so any
+        # concurrent WS push that arrives first can still be correlated.
+        strategy    = order.get("strategy", "")
+        cl_ord_id   = order.get("client_order_id") or self._gen_cl_ord_id(strategy)
+        now_ms      = int(time.time() * 1000)
+        # Record strategy so WS fill pushes (which carry no strategy field) can
+        # recover it via _build_order_update_from_ws.
+        if cl_ord_id and strategy:
+            self._cl_to_strategy[cl_ord_id] = strategy
+
         body = {
-            "instId": order["symbol"],
-            "tdMode": "cross",  # cross margin
-            "side": order["side"],
+            "instId":  order["symbol"],
+            "tdMode":  "cross",              # cross margin
+            "side":    order["side"],
             "ordType": order.get("order_type", "limit"),
-            "sz": str(order["quantity"]),
+            "sz":      str(order["quantity"]),
+            "clOrdId": cl_ord_id,
         }
-        if order.get("order_type") == "limit":
+        if order.get("order_type", "limit") == "limit":
             body["px"] = str(order["price"])
+
+        # Create a pending_submit entry immediately so we track the order from
+        # the first instant, before the exchange ACK or any WS push.
+        pending_update = OrderUpdate(
+            client_order_id = cl_ord_id,
+            order_id        = "",            # unknown until ACK
+            gateway         = self.gateway_name,
+            strategy        = strategy,
+            symbol          = order["symbol"],
+            side            = order["side"],
+            order_type      = order.get("order_type", "limit"),
+            price           = float(order.get("price", 0)),
+            quantity        = float(order["quantity"]),
+            state           = OrderState.PENDING_SUBMIT,
+            create_time_ms  = now_ms,
+            update_time_ms  = now_ms,
+            update_source   = "rest",
+        )
+        await self._process_order_update(pending_update)
 
         resp = await self._rest_request("POST", path, body)
         if resp and resp.get("code") == "0":
             order_id = resp["data"][0]["ordId"]
-            self.logger.info("Order placed: %s %s %s qty=%s @ %s -> ordId=%s",
-                             order["side"], order.get("order_type", "limit"),
-                             order["symbol"], order["quantity"],
-                             order.get("price", "MKT"), order_id)
-            await self._update_pending_orders({
-                "order_id": order_id,
-                "symbol": order["symbol"],
-                "side": order["side"],
-                "order_type": order.get("order_type", "limit"),
-                "price": str(order.get("price", 0)),
-                "quantity": str(order["quantity"]),
-                "filled_qty": "0",
-                "state": "live",
-                "timestamp": str(int(time.time() * 1000)),
-            })
+            self._cl_to_ord[cl_ord_id] = order_id
+            self._ord_to_cl[order_id]  = cl_ord_id
+            self.logger.info(
+                "Order placed: %s %s %s qty=%s @ %s -> clOrdId=%s ordId=%s",
+                order["side"], order.get("order_type", "limit"),
+                order["symbol"], order["quantity"],
+                order.get("price", "MKT"), cl_ord_id, order_id,
+            )
+            # Patch order_id into the pending record
+            open_update = OrderUpdate(
+                client_order_id = cl_ord_id,
+                order_id        = order_id,
+                gateway         = self.gateway_name,
+                strategy        = strategy,
+                symbol          = order["symbol"],
+                side            = order["side"],
+                order_type      = order.get("order_type", "limit"),
+                price           = float(order.get("price", 0)),
+                quantity        = float(order["quantity"]),
+                state           = OrderState.OPEN,
+                create_time_ms  = now_ms,
+                update_time_ms  = int(time.time() * 1000),
+                update_source   = "rest",
+            )
+            await self._process_order_update(open_update)
             return order_id
         else:
             self.logger.error("Order failed: %s", resp)
             err_msg = ""
             if resp and resp.get("data"):
                 err_msg = resp["data"][0].get("sMsg", "")
-            await self._update_pending_orders({
-                "order_id": "",
-                "symbol": order["symbol"],
-                "side": order["side"],
-                "order_type": order.get("order_type", "limit"),
-                "price": str(order.get("price", 0)),
-                "quantity": str(order["quantity"]),
-                "filled_qty": "0",
-                "state": "rejected",
-                "comment": err_msg,
-                "timestamp": str(int(time.time() * 1000)),
-            })
+            rejected = OrderUpdate(
+                client_order_id = cl_ord_id,
+                order_id        = "",
+                gateway         = self.gateway_name,
+                strategy        = strategy,
+                symbol          = order["symbol"],
+                side            = order["side"],
+                order_type      = order.get("order_type", "limit"),
+                price           = float(order.get("price", 0)),
+                quantity        = float(order["quantity"]),
+                state           = OrderState.REJECTED,
+                update_time_ms  = int(time.time() * 1000),
+                update_source   = "rest",
+            )
+            await self._process_order_update(rejected)
             return ""
 
     async def cancel_order(self, order: dict) -> None:
         path = "/api/v5/trade/cancel-order"
-        body = {
-            "instId": order.get("symbol", ""),
-            "ordId": order.get("order_id", ""),
-        }
+        order_id  = order.get("order_id", "")
+        cl_ord_id = order.get("client_order_id", "") or self._ord_to_cl.get(order_id, "")
+        body: dict = {"instId": order.get("symbol", "")}
+        # Prefer clOrdId if available (idempotent even if ordId changes on amend)
+        if cl_ord_id:
+            body["clOrdId"] = cl_ord_id
+        else:
+            body["ordId"] = order_id
         resp = await self._rest_request("POST", path, body)
         if resp and resp.get("code") == "0":
-            self.logger.info("Cancelled order %s", order.get("order_id"))
-            await self._sync_single_order(order.get("order_id", ""), order.get("symbol", ""))
+            self.logger.info("Cancelled order clOrdId=%s ordId=%s", cl_ord_id, order_id)
+            # REST ACK only tells us it was accepted; the definitive state arrives
+            # via WS push.  We do a REST sync only as a fallback when WS is slow.
+            await self._sync_single_order(order_id, order.get("symbol", ""),
+                                          cl_ord_id=cl_ord_id)
         else:
             self.logger.error("Cancel failed: %s", resp)
 
     async def amend_order(self, order: dict) -> None:
         path = "/api/v5/trade/amend-order"
-        body = {
-            "instId": order.get("symbol", ""),
-            "ordId": order.get("order_id", ""),
-        }
+        order_id  = order.get("order_id", "")
+        cl_ord_id = order.get("client_order_id", "") or self._ord_to_cl.get(order_id, "")
+        body: dict = {"instId": order.get("symbol", "")}
+        if cl_ord_id:
+            body["clOrdId"] = cl_ord_id
+        else:
+            body["ordId"] = order_id
         if order.get("price"):
             body["newPx"] = str(order["price"])
         if order.get("quantity"):
             body["newSz"] = str(order["quantity"])
         resp = await self._rest_request("POST", path, body)
         if resp and resp.get("code") == "0":
-            self.logger.info("Amended order %s", order.get("order_id"))
-            await self._sync_single_order(order.get("order_id", ""), order.get("symbol", ""))
+            self.logger.info("Amended order clOrdId=%s ordId=%s", cl_ord_id, order_id)
+            await self._sync_single_order(order_id, order.get("symbol", ""),
+                                          cl_ord_id=cl_ord_id)
         else:
             self.logger.error("Amend failed: %s", resp)
 
-    async def _sync_single_order(self, order_id: str, symbol: str) -> None:
-        """Query an order's latest state from OKX and update Redis."""
+    async def _sync_single_order(self, order_id: str, symbol: str, *,
+                                 cl_ord_id: str = "") -> None:
+        """Query an order's latest state from OKX REST and update Redis.
+
+        This is a fallback / reconciliation path.  The WS push is the primary
+        source of truth.  Both paths share ``_process_order_update`` which
+        deduplicates terminal writes via the was_pending guard.
+        """
         try:
             path = f"/api/v5/trade/order?instId={symbol}&ordId={order_id}"
             resp = await self._rest_request("GET", path)
             if resp and resp.get("code") == "0" and resp.get("data"):
                 record = resp["data"][0]
-                await self._update_pending_orders({
-                    "order_id": record.get("ordId", ""),
-                    "symbol": record.get("instId", ""),
-                    "side": record.get("side", ""),
-                    "order_type": record.get("ordType", ""),
-                    "price": record.get("px", "0"),
-                    "quantity": record.get("sz", "0"),
-                    "filled_qty": record.get("accFillSz", "0"),
-                    "avg_price": record.get("avgPx", "0"),
-                    "state": record.get("state", ""),
-                    "timestamp": record.get("uTime", ""),
-                })
+                update = self._build_order_update_from_rest(record, cl_ord_id=cl_ord_id)
+                await self._process_order_update(update)
         except Exception as e:
             self.logger.error("Failed to sync order %s: %s", order_id, e)
 
@@ -662,7 +832,99 @@ class OKXGateway(BaseGateway):
     def _get_timestamp(self) -> str:
         return time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime())
 
+    async def _public_rest_request(self, path: str) -> dict:
+        """GET a public (no-auth) OKX endpoint."""
+        url = self.REST_BASE + path
+        async with self._session.get(url) as resp:
+            return await resp.json()
+
+    # ── Instrument metadata ──────────────────────────────────────────────
+
+    async def _fetch_and_store_instruments(self) -> None:
+        try:
+            r = self.redis.client
+            instruments = {}
+            seen_types = {"SWAP", "FUTURES"}
+            for symbol in self.symbols:
+                if not symbol.endswith("-SWAP") and not symbol.split("-")[-1].isdigit():
+                    seen_types.add("SPOT")
+
+            for inst_type in seen_types:
+                resp = await self._public_rest_request(
+                    f"/api/v5/public/instruments?instType={inst_type}"
+                )
+                if resp and resp.get("code") == "0":
+                    for inst in resp.get("data", []):
+                        instruments[inst["instId"]] = {
+                            "instId":    inst.get("instId", ""),
+                            "instType":  inst.get("instType", ""),
+                            "expTime":   inst.get("expTime", ""),
+                            "ctVal":     inst.get("ctVal", ""),
+                            "tickSz":    inst.get("tickSz", ""),
+                            "lotSz":     inst.get("lotSz", ""),
+                            "listTime":  inst.get("listTime", ""),
+                            "uly":       inst.get("uly", ""),
+                            "settleCcy": inst.get("settleCcy", ""),
+                        }
+            await r.set(f"instruments:{self.gateway_name}",
+                        json.dumps(instruments), ex=7200)
+            self.logger.info("Fetched %d instruments", len(instruments))
+        except Exception as e:
+            self.logger.error("Failed to fetch instruments: %s", e)
+
+    async def _refresh_instruments_loop(self) -> None:
+        while self.running:
+            await asyncio.sleep(3600)
+            await self._fetch_and_store_instruments()
+
+    # ── Fee rates ────────────────────────────────────────────────────────
+
+    async def _fetch_fee_rates(self) -> None:
+        try:
+            r = self.redis.client
+            fees = {}
+            for inst_type in ("SWAP", "FUTURES", "SPOT"):
+                resp = await self._rest_request(
+                    "GET", f"/api/v5/account/trade-fee?instType={inst_type}"
+                )
+                if resp and resp.get("code") == "0" and resp.get("data"):
+                    item = resp["data"][0]
+                    fees[inst_type] = {
+                        "maker":  item.get("maker", ""),
+                        "taker":  item.get("taker", ""),
+                        "makerU": item.get("makerU", ""),
+                        "takerU": item.get("takerU", ""),
+                    }
+            await r.set(f"fees:{self.gateway_name}", json.dumps(fees), ex=86400)
+            self.logger.info("Fetched fee rates: %s", list(fees.keys()))
+        except Exception as e:
+            self.logger.error("Failed to fetch fee rates: %s", e)
+
+    # ── Cancel-on-disconnect ─────────────────────────────────────────────
+
+    async def _cancel_all_after(self, timeout_seconds: int) -> None:
+        path = "/api/v5/trade/cancel-all-after"
+        body = {"timeOut": str(timeout_seconds)}
+        resp = await self._rest_request("POST", path, body)
+        if resp and resp.get("code") == "0":
+            self.logger.info("cancel-all-after set to %ds", timeout_seconds)
+        else:
+            self.logger.error("cancel-all-after failed: %s", resp)
+
+    async def _cod_keepalive_loop(self) -> None:
+        while self.running:
+            try:
+                await self._cancel_all_after(120)
+            except Exception as e:
+                self.logger.error("CoD keepalive error: %s", e)
+            await asyncio.sleep(90)
+
     async def disconnect_exchange(self) -> None:
+        if self._has_credentials() and self._session:
+            try:
+                await self._cancel_all_after(0)
+            except Exception:
+                pass
         if self._ws_public:
             await self._ws_public.close()
         if self._ws_private:

@@ -51,6 +51,14 @@ class BaseStrategy(ABC):
         self._signal_count = 0
         self._last_signal: Optional[dict] = None
 
+        # In-strategy position tracking (accumulated from on_fill)
+        self.positions: dict[str, float] = {}
+        # Open order tracking (maintained by on_order_update)
+        self._open_orders: dict[str, dict] = {}
+        # Multi-symbol state caches (populated by container before dispatch)
+        self._latest_ticks: dict[str, dict] = {}
+        self._latest_books: dict[str, dict] = {}
+
         self._register_periodic_methods()
 
     def _build_dataclass(self, cls, overrides: dict):
@@ -174,11 +182,50 @@ class BaseStrategy(ABC):
         return None
 
     def on_order_update(self, order: dict) -> None:
-        """Called when an order belonging to this strategy changes state."""
-        pass
+        """Called when an order belonging to this strategy changes state.
+        Default maintains _open_orders. Subclasses should call super() first."""
+        cl_id = order.get("client_order_id", "")
+        if not cl_id:
+            return
+        state = order.get("state", "")
+        if state in ("filled", "cancelled", "rejected", "expired"):
+            self._open_orders.pop(cl_id, None)
+        else:
+            self._open_orders[cl_id] = order
 
     def on_fill(self, fill: dict) -> None:
-        """Called when a fill belongs to this strategy."""
+        """Called when a fill belongs to this strategy.
+        Default accumulates positions. Subclasses should call super() first."""
+        symbol = fill.get("symbol", "")
+        side = fill.get("side", "")
+        qty = float(fill.get("quantity", 0) or 0)
+        if not symbol or qty <= 0:
+            return
+        current = self.positions.get(symbol, 0.0)
+        if side == "buy":
+            self.positions[symbol] = current + qty
+        elif side == "sell":
+            self.positions[symbol] = current - qty
+
+    def on_position(self, position: dict) -> None:
+        """Reconcile in-memory position with exchange truth."""
+        symbol = position.get("symbol", "")
+        qty = float(position.get("quantity", 0) or 0)
+        if symbol:
+            self.positions[symbol] = qty
+
+    def on_funding_rate(self, data: dict) -> None:
+        """Called when a funding rate update arrives for a subscribed symbol."""
+        pass
+
+    async def on_pause(self) -> None:
+        """Called when the strategy is disabled (paused) via dashboard/command.
+        Strategy may cancel orders, reduce exposure, etc. Will be re-enabled later."""
+        pass
+
+    async def on_stop(self) -> None:
+        """Called when the strategy is killed by the risk engine.
+        Strategy should cancel all orders and clean up. Not expected to resume."""
         pass
 
     # back-compat alias
@@ -187,6 +234,52 @@ class BaseStrategy(ABC):
 
     def on_kline(self, symbol: str, kline: dict) -> Optional[dict]:
         return None
+
+    # ── Open order helpers ───────────────────────────────────────────────
+
+    def get_open_orders(self, symbol: str = None, side: str = None) -> list[dict]:
+        orders = list(self._open_orders.values())
+        if symbol:
+            orders = [o for o in orders if o.get("symbol") == symbol]
+        if side:
+            orders = [o for o in orders if o.get("side") == side]
+        return orders
+
+    def has_open_order(self, symbol: str, side: str = None) -> bool:
+        return len(self.get_open_orders(symbol=symbol, side=side)) > 0
+
+    # ── Position helpers ─────────────────────────────────────────────────
+
+    def get_position(self, symbol: str) -> float:
+        return self.positions.get(symbol, 0.0)
+
+    # ── Multi-symbol state helpers ───────────────────────────────────────
+
+    def get_cached_tick(self, symbol: str) -> dict:
+        return self._latest_ticks.get(symbol, {})
+
+    def get_cached_book(self, symbol: str) -> dict:
+        return self._latest_books.get(symbol, {})
+
+    def all_books_ready(self, *symbols: str) -> bool:
+        return all(s in self._latest_books for s in symbols)
+
+    # ── Instrument & fee helpers ─────────────────────────────────────────
+
+    async def get_instrument(self, symbol: str) -> dict:
+        if self._container:
+            return await self._container.strategy_get_instrument(self.gateway, symbol)
+        return {}
+
+    async def get_instruments(self) -> dict:
+        if self._container:
+            return await self._container.strategy_get_instruments(self.gateway)
+        return {}
+
+    async def get_fee_rates(self) -> dict:
+        if self._container:
+            return await self._container.strategy_get_fee_rates(self.gateway)
+        return {}
 
 
 def periodic(interval: float):

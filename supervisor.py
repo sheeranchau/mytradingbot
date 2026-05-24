@@ -19,6 +19,20 @@ import sys
 import time
 from pathlib import Path
 
+
+def _load_env_file(path: Path) -> dict:
+    """Parse a .env file and return a dict of key=value pairs."""
+    env = {}
+    if not path.exists():
+        return env
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, val = line.partition("=")
+        env[key.strip()] = val.strip()
+    return env
+
 PIDFILE_DIR = Path(__file__).parent / ".pids"
 LOG_DIR = Path(__file__).parent / "logs"
 
@@ -102,6 +116,11 @@ def start_process(name: str) -> bool:
     module = PROCESS_REGISTRY[name]
     log_file = LOG_DIR / f"{name}.log"
 
+    # Build env: current environment + .env file overrides
+    child_env = os.environ.copy()
+    dot_env = _load_env_file(Path(__file__).parent / ".env")
+    child_env.update(dot_env)
+
     # Start as a detached subprocess
     with open(log_file, "a") as log:
         proc = subprocess.Popen(
@@ -110,6 +129,7 @@ def start_process(name: str) -> bool:
             stdout=log,
             stderr=subprocess.STDOUT,
             start_new_session=True,
+            env=child_env,
         )
 
     # Write pidfile
@@ -151,49 +171,94 @@ def stop_process(name: str, timeout: int = 10) -> bool:
     return True
 
 
+# ── ANSI colour helpers ────────────────────────────────────────────────────────
+_RESET  = "\033[0m"
+_BOLD   = "\033[1m"
+_DIM    = "\033[2m"
+_RED    = "\033[91m"
+_GREEN  = "\033[92m"
+_YELLOW = "\033[93m"
+_CYAN   = "\033[96m"
+_WHITE  = "\033[97m"
+
+def _c(text, *codes):
+    return "".join(codes) + str(text) + _RESET
+
+def _ttl_color(ttl: int) -> str:
+    """Colour TTL: green ≥ 20s, yellow 10–19s, red < 10s."""
+    if ttl >= 20:
+        return _c(f"{ttl}s", _GREEN)
+    elif ttl >= 10:
+        return _c(f"{ttl}s", _YELLOW)
+    else:
+        return _c(f"{ttl}s", _RED)
+
+
 def show_status():
-    """Show status of all processes in a table."""
-    print(f"\n{'Process':<25} {'PID':<10} {'Status':<12} {'Uptime':<15}")
-    print("-" * 62)
+    """Show status of all processes in a colour table."""
+    header = (f"\n{_c('Process', _BOLD, _CYAN):<34} "
+              f"{_c('PID', _BOLD, _CYAN):<19} "
+              f"{_c('Status', _BOLD, _CYAN):<21} "
+              f"{_c('Uptime', _BOLD, _CYAN)}")
+    divider = _c("─" * 62, _DIM)
+    print(header)
+    print(divider)
 
     all_healthy = True
     for name in STARTUP_ORDER:
         info = process_status(name)
-        pid_str = str(info["pid"]) if info["pid"] else "-"
-        uptime_str = _format_uptime(info["uptime"]) if info["status"] == "running" else "-"
-        status = info["status"]
+        pid_str    = _c(str(info["pid"]), _YELLOW) if info["pid"] else _c("-", _DIM)
+        uptime_str = _c(_format_uptime(info["uptime"]), _WHITE) if info["status"] == "running" else _c("-", _DIM)
 
-        if status == "running":
-            status_display = "running"
+        if info["status"] == "running":
+            status_display = _c("● running", _GREEN, _BOLD)
         else:
-            status_display = "stopped"
+            status_display = _c("○ stopped", _RED)
             all_healthy = False
 
-        print(f"{name:<25} {pid_str:<10} {status_display:<12} {uptime_str:<15}")
+        # pad accounting: colour codes add invisible chars, adjust manually
+        name_col   = f"{_c(name, _WHITE):<{25 + len(_WHITE) + len(_RESET)}}"
+        pid_col    = f"{pid_str:<{10 + len(_YELLOW) + len(_RESET)}}"
+        status_col = f"{status_display:<{12 + len(_GREEN) + len(_BOLD) + len(_RESET)}}"
+        print(f"  {name_col} {pid_col} {status_col} {uptime_str}")
 
-    print("-" * 62)
+    print(divider)
 
-    # Also check Redis for heartbeat info
+    # ── Redis heartbeat section ────────────────────────────────────────────────
     try:
         import redis
-        r = redis.Redis(decode_responses=True)
+        _redis_pw  = os.environ.get("REDIS_PASSWORD", "")
+        _redis_url = (
+            f"redis://default:{_redis_pw}@127.0.0.1:6379"
+            if _redis_pw else "redis://127.0.0.1:6379"
+        )
+        r = redis.from_url(_redis_url, decode_responses=True)
         r.ping()
+        redis_label = _c("Redis", _BOLD, _GREEN) + _c(" ✓  heartbeats:", _GREEN)
         heartbeat_keys = r.keys("heartbeat:*")
         if heartbeat_keys:
-            print(f"\nRedis heartbeats ({len(heartbeat_keys)}):")
+            print(f"\n{redis_label}")
             for key in sorted(heartbeat_keys):
-                hb = r.hgetall(key)
-                name = key.replace("heartbeat:", "")
+                hb  = r.hgetall(key)
+                hb_name = key.replace("heartbeat:", "")
                 ttl = r.ttl(key)
-                print(f"  {name}: pid={hb.get('pid', '?')}, "
-                      f"uptime={hb.get('uptime', '?')}s, "
-                      f"ttl={ttl}s")
+                uptime_raw = hb.get("uptime", "?")
+                try:
+                    uptime_fmt = _format_uptime(float(uptime_raw))
+                except (ValueError, TypeError):
+                    uptime_fmt = f"{uptime_raw}s"
+                print(f"  {_c(hb_name, _CYAN):<{20 + len(_CYAN) + len(_RESET)}}  "
+                      f"pid={_c(hb.get('pid', '?'), _YELLOW)}  "
+                      f"up={_c(uptime_fmt, _WHITE)}  "
+                      f"ttl={_ttl_color(ttl)}")
+        else:
+            print(f"\n{redis_label} {_c('(no heartbeat keys yet)', _DIM)}")
         r.close()
-    except Exception:
-        print("\nRedis: not reachable (heartbeat data unavailable)")
+    except Exception as exc:
+        print(f"\n{_c('Redis', _BOLD, _RED)} {_c('✗  not reachable', _RED)} "
+              f"{_c(f'({exc})', _DIM)}")
 
     print()
-    return all_healthy
 
 
 def _format_uptime(seconds: float) -> str:

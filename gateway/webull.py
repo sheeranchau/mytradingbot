@@ -9,6 +9,23 @@ Webull gateway: market data + trading for US Stocks/ETFs and HK Stocks.
   (L2 requires login + paid subscription).
 - Trading: webull library REST API. Market / Limit / Stop / Stop-Limit,
   with extended-hours support.
+
+Order lifecycle tracking
+------------------------
+Webull does not expose a real-time order-update push or per-fill IDs.
+Order state is tracked by polling ``get_order()`` every
+``ORDER_POLL_INTERVAL`` seconds for all active orders.  When a change in
+``filledQuantity`` is detected we synthesise a fill event with a local
+fill_id of ``{order_id}-{now_ms}`` so each detected fill batch is
+distinguishable in the fills stream.
+
+Webull status → OrderState mapping
+  Working / Queued → OPEN
+  Partial Filled   → PARTIAL
+  All Filled       → FILLED
+  Cancelled        → CANCELLED
+  Expired          → EXPIRED
+  Failed           → REJECTED
 """
 import asyncio
 import json
@@ -21,6 +38,25 @@ from typing import Optional
 import paho.mqtt.client as mqtt
 
 from gateway.base import BaseGateway
+from core.models import OrderUpdate, OrderState
+
+
+# Webull REST status string → normalised OrderState
+_WB_STATE: dict[str, str] = {
+    "Working":        OrderState.OPEN,
+    "Queued":         OrderState.OPEN,
+    "Pending":        OrderState.PENDING_SUBMIT,
+    "Partial Filled": OrderState.PARTIAL,
+    "All Filled":     OrderState.FILLED,
+    "Filled":         OrderState.FILLED,
+    "Cancelled":      OrderState.CANCELLED,
+    "Canceled":       OrderState.CANCELLED,
+    "Expired":        OrderState.EXPIRED,
+    "Failed":         OrderState.REJECTED,
+}
+
+# Seconds between order-status polls
+ORDER_POLL_INTERVAL = 2.0
 
 
 class WebullGateway(BaseGateway):
@@ -82,6 +118,12 @@ class WebullGateway(BaseGateway):
         # Local L2 book state (only used when L2 stream is available)
         self._orderbooks: dict = {}
 
+        # Track last-seen filledQuantity per order_id to detect incremental fills
+        # { order_id: float }
+        self._last_filled_qty: dict[str, float] = {}
+        # Tracks previous avg_fill_price to back-calculate marginal fill price.
+        self._last_avg_price: dict[str, float] = {}
+
         mode = "PAPER" if paper else "LIVE"
         self.logger.info("Initialized in %s mode (region=%s, ext_hours=%s)",
                          mode, self.region, self.extended_hours)
@@ -130,6 +172,11 @@ class WebullGateway(BaseGateway):
 
         # 4) Start the asyncio worker that drains MQTT->queue
         asyncio.create_task(self._process_mq_queue())
+
+        # 5) Reconcile pending orders from last session, then start polling
+        if self._authenticated:
+            await self._sync_pending_orders()
+            asyncio.create_task(self._poll_orders_loop())
 
     async def _login(self) -> None:
         """Log into Webull. Uses TOTP seed for unattended MFA if available."""
@@ -303,6 +350,133 @@ class WebullGateway(BaseGateway):
             await asyncio.sleep(1)
 
     # ──────────────────────────────────────────────────────────────────────
+    # Startup reconciliation + polling
+    # ──────────────────────────────────────────────────────────────────────
+    async def _sync_pending_orders(self) -> None:
+        """Reconcile Redis state against Webull on startup / reconnect.
+
+        Three things happen here:
+        1. Rebuild ``_cl_to_ord`` / ``_ord_to_cl`` maps from persisted Redis
+           data (Webull doesn't store clOrdId, so the maps are always lost on
+           restart and must be recovered from Redis).
+        2. Seed ``_last_filled_qty`` from the persisted ``filled_qty`` value so
+           the first poll does not emit spurious fill events for quantity that
+           was already filled before the restart.
+        3. Query each order from Webull to catch any state changes (fills,
+           cancels) that happened while the gateway was offline.
+        """
+        try:
+            r = self.redis.client
+            raw = await r.get(f"pending_orders:{self.gateway_name}")
+            pending: list[dict] = json.loads(raw) if raw else []
+
+            for o in pending:
+                order_id  = o.get("order_id", "")
+                cl_ord_id = o.get("client_order_id", "")
+                # 1. Rebuild ID maps
+                if order_id and cl_ord_id:
+                    self._cl_to_ord[cl_ord_id] = order_id
+                    self._ord_to_cl[order_id]  = cl_ord_id
+                # 2. Seed last_filled_qty / last_avg_price so first poll delta = 0
+                #    for unchanged orders and marginal price is correct.
+                if order_id:
+                    self._last_filled_qty[order_id] = float(o.get("filled_qty", 0) or 0)
+                    self._last_avg_price[order_id]  = float(o.get("avg_fill_price", 0) or 0)
+
+            # 3. Query exchange for each order to catch offline changes
+            checked = 0
+            for o in pending:
+                order_id = o.get("order_id", "")
+                if not order_id:
+                    continue
+                try:
+                    resp = await self._loop.run_in_executor(
+                        None, self._wb.get_order, order_id
+                    )
+                    if resp:
+                        await self._handle_order_poll(o, resp)
+                        checked += 1
+                except Exception as exc:
+                    self.logger.debug("Startup sync order %s: %s", order_id, exc)
+
+            self.logger.info("Startup sync: %d pending orders, %d queried from exchange",
+                             len(pending), checked)
+        except Exception as e:
+            self.logger.error("Failed to sync pending orders on startup: %s", e)
+
+    async def _poll_orders_loop(self) -> None:
+        """Periodically query Webull for the status of all tracked pending orders."""
+        while self.running:
+            try:
+                await asyncio.sleep(ORDER_POLL_INTERVAL)
+                r = self.redis.client
+                raw = await r.get("pending_orders:webull")
+                pending: list[dict] = json.loads(raw) if raw else []
+                for o in pending:
+                    order_id = o.get("order_id", "")
+                    if not order_id:
+                        continue
+                    try:
+                        resp = await self._loop.run_in_executor(
+                            None, self._wb.get_order, order_id
+                        )
+                        if resp:
+                            await self._handle_order_poll(o, resp)
+                    except Exception as exc:
+                        self.logger.debug("Poll order %s error: %s", order_id, exc)
+            except Exception as exc:
+                self.logger.debug("_poll_orders_loop error: %s", exc)
+
+    async def _handle_order_poll(self, cached: dict, resp: dict) -> None:
+        """Process a single polled order response and emit an OrderUpdate if changed."""
+        order_id   = str(resp.get("orderId", cached.get("order_id", "")))
+        cl_ord_id  = cached.get("client_order_id", self._ord_to_cl.get(order_id, ""))
+        raw_status = str(resp.get("status", resp.get("statusStr", "")))
+        state      = _WB_STATE.get(raw_status, OrderState.OPEN)
+
+        new_filled = float(resp.get("filledQuantity", resp.get("filledQty", 0)) or 0)
+        avg_price  = float(resp.get("avgFilledPrice", resp.get("averageFilledPrice", 0)) or 0)
+        prev_filled = self._last_filled_qty.get(order_id, 0.0)
+        fill_delta  = new_filled - prev_filled
+
+        # Derive fill_id only when there is new quantity filled
+        fill_id = ""
+        if fill_delta > 0:
+            fill_id = f"{order_id}-{int(time.time() * 1000)}"
+            self._last_filled_qty[order_id] = new_filled
+
+        marginal_price = 0.0
+        if fill_id:
+            prev_avg = self._last_avg_price.get(order_id, 0.0)
+            if prev_filled > 0 and prev_avg > 0:
+                marginal_price = (avg_price * new_filled - prev_avg * prev_filled) / fill_delta
+            else:
+                marginal_price = avg_price  # first fill: avg == marginal
+            self._last_avg_price[order_id] = avg_price
+
+        update = OrderUpdate(
+            client_order_id = cl_ord_id,
+            order_id        = order_id,
+            gateway         = self.gateway_name,
+            strategy        = cached.get("strategy", ""),
+            symbol          = cached.get("symbol", ""),
+            side            = cached.get("side", ""),
+            order_type      = cached.get("order_type", "limit"),
+            price           = float(cached.get("price", 0) or 0),
+            quantity        = float(cached.get("quantity", 0) or 0),
+            state           = state,
+            filled_qty      = new_filled,
+            avg_fill_price  = avg_price,
+            # Fill fields — populated only when new quantity has been executed
+            fill_id         = fill_id,
+            fill_price      = marginal_price if fill_id else 0.0,
+            fill_qty        = fill_delta if fill_id else 0.0,
+            update_time_ms  = int(time.time() * 1000),
+            update_source   = "rest_poll",
+        )
+        await self._process_order_update(update)
+
+    # ──────────────────────────────────────────────────────────────────────
     # Orders
     # ──────────────────────────────────────────────────────────────────────
     def _require_auth(self) -> bool:
@@ -314,6 +488,11 @@ class WebullGateway(BaseGateway):
     async def send_order(self, order: dict) -> str:
         if not self._require_auth():
             return ""
+
+        strategy   = order.get("strategy", "")
+        cl_ord_id  = order.get("client_order_id") or self._gen_cl_ord_id(strategy)
+        now_ms     = int(time.time() * 1000)
+
         symbol = order["symbol"]
         tid = self._symbol_to_tid.get(symbol)
         if not tid:
@@ -328,10 +507,10 @@ class WebullGateway(BaseGateway):
         side = "BUY" if str(order.get("side", "buy")).lower() == "buy" else "SELL"
         order_type_raw = str(order.get("order_type", "limit")).lower()
         order_type = self.ORDER_TYPE_MAP.get(order_type_raw, "LMT")
-        quantity = int(order["quantity"])
-        price = float(order.get("price", 0) or 0)
+        quantity   = int(order["quantity"])
+        price      = float(order.get("price", 0) or 0)
         stop_price = order.get("stop_price")
-        enforce = str(order.get("time_in_force", "DAY")).upper()  # DAY/GTC
+        enforce    = str(order.get("time_in_force", "DAY")).upper()
 
         kwargs = dict(
             tId=tid,
@@ -345,33 +524,108 @@ class WebullGateway(BaseGateway):
         if order_type in ("STP", "STP LMT") and stop_price is not None:
             kwargs["stpPrice"] = float(stop_price)
 
+        # Record PENDING_SUBMIT immediately
+        pending_update = OrderUpdate(
+            client_order_id = cl_ord_id,
+            order_id        = "",
+            gateway         = self.gateway_name,
+            strategy        = strategy,
+            symbol          = symbol,
+            side            = order.get("side", "buy"),
+            order_type      = order_type_raw,
+            price           = price,
+            quantity        = float(quantity),
+            state           = OrderState.PENDING_SUBMIT,
+            create_time_ms  = now_ms,
+            update_time_ms  = now_ms,
+            update_source   = "rest",
+        )
+        await self._process_order_update(pending_update)
+
         try:
             resp = await self._loop.run_in_executor(
                 None, lambda: self._wb.place_order(**kwargs)
             )
         except Exception as exc:
             self.logger.error("place_order error: %s", exc)
-            return ""
+            resp = None
 
-        if not isinstance(resp, dict):
-            self.logger.error("place_order returned non-dict: %r", resp)
-            return ""
-        if not resp.get("success", True) and resp.get("code"):
-            self.logger.error("Order rejected: %s", resp)
+        if not resp or (not resp.get("success", True) and resp.get("code")):
+            self.logger.error("Order rejected: %r", resp)
+            await self._process_order_update(OrderUpdate(
+                client_order_id = cl_ord_id,
+                order_id        = "",
+                gateway         = self.gateway_name,
+                strategy        = strategy,
+                symbol          = symbol,
+                side            = order.get("side", "buy"),
+                order_type      = order_type_raw,
+                price           = price,
+                quantity        = float(quantity),
+                state           = OrderState.REJECTED,
+                update_time_ms  = int(time.time() * 1000),
+                update_source   = "rest",
+            ))
             return ""
 
         order_id = str(resp.get("orderId") or resp.get("data", {}).get("orderId", ""))
-        self.logger.info("Order placed: %s %s %s @ %s -> id=%s",
-                         side, quantity, symbol, price or "MKT", order_id)
+        self._cl_to_ord[cl_ord_id] = order_id
+        self._ord_to_cl[order_id]  = cl_ord_id
+        self._last_filled_qty[order_id] = 0.0
+        self._last_avg_price[order_id]  = 0.0
+
+        self.logger.info("Order placed: %s %s %s @ %s -> clOrdId=%s ordId=%s",
+                         side, quantity, symbol, price or "MKT", cl_ord_id, order_id)
+
+        await self._process_order_update(OrderUpdate(
+            client_order_id = cl_ord_id,
+            order_id        = order_id,
+            gateway         = self.gateway_name,
+            strategy        = strategy,
+            symbol          = symbol,
+            side            = order.get("side", "buy"),
+            order_type      = order_type_raw,
+            price           = price,
+            quantity        = float(quantity),
+            state           = OrderState.OPEN,
+            create_time_ms  = now_ms,
+            update_time_ms  = int(time.time() * 1000),
+            update_source   = "rest",
+        ))
         return order_id
 
     async def cancel_order(self, order: dict) -> None:
         if not self._require_auth():
             return
-        order_id = order.get("order_id", "")
+        order_id  = order.get("order_id", "")
+        cl_ord_id = order.get("client_order_id", "") or self._ord_to_cl.get(order_id, "")
         try:
             await self._loop.run_in_executor(None, self._wb.cancel_order, order_id)
-            self.logger.info("Cancelled order %s", order_id)
+            self.logger.info("Cancelled order clOrdId=%s ordId=%s", cl_ord_id, order_id)
+            # Emit CANCELLED update (polling will confirm; this is optimistic)
+            pending_key = f"pending_orders:{self.gateway_name}"
+            r = self.redis.client
+            raw = await r.get(pending_key)
+            orders: list[dict] = json.loads(raw) if raw else []
+            cached = next((o for o in orders
+                           if o.get("client_order_id") == cl_ord_id
+                           or o.get("order_id") == order_id), {})
+            await self._process_order_update(OrderUpdate(
+                client_order_id = cl_ord_id,
+                order_id        = order_id,
+                gateway         = self.gateway_name,
+                strategy        = cached.get("strategy", ""),
+                symbol          = order.get("symbol", cached.get("symbol", "")),
+                side            = cached.get("side", ""),
+                order_type      = cached.get("order_type", "limit"),
+                price           = float(cached.get("price", 0) or 0),
+                quantity        = float(cached.get("quantity", 0) or 0),
+                filled_qty      = float(cached.get("filled_qty", 0) or 0),
+                avg_fill_price  = float(cached.get("avg_fill_price", 0) or 0),
+                state           = OrderState.CANCELLED,
+                update_time_ms  = int(time.time() * 1000),
+                update_source   = "rest",
+            ))
         except Exception as exc:
             self.logger.error("cancel_order(%s) error: %s", order_id, exc)
 

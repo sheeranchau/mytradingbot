@@ -482,7 +482,8 @@
             display: none;
         }
         .order-result.success { display: block; background: #1b4332; color: #2dd4bf; border: 1px solid #2dd4bf44; }
-        .order-result.error { display: block; background: #3d1a1a; color: #f87171; border: 1px solid #f8717144; }
+        .order-result.error   { display: block; background: #3d1a1a; color: #f87171; border: 1px solid #f8717144; }
+        .order-result.warning { display: block; background: #332b00; color: #fbbf24; border: 1px solid #fbbf2444; }
 
         /* Order history */
         .order-history {
@@ -571,6 +572,14 @@
                 <div class="card-title">Open Positions</div>
                 <div id="acct-positions" style="overflow-x:auto;"></div>
             </div>
+            <div class="card" style="margin-bottom:16px;">
+                <div class="card-title" style="display:flex; justify-content:space-between; align-items:center;">
+                    <span>P&amp;L &amp; Delta</span>
+                    <span style="font-size:11px; color:#8b949e; font-weight:400">risk engine · updated on each fill / tick</span>
+                </div>
+                <div id="pnl-summary" style="margin-bottom:12px;"></div>
+                <div id="pnl-positions"></div>
+            </div>
             <div class="grid grid-2" style="margin-bottom:16px;">
                 <div class="card">
                     <div class="card-title">Trading Account (per currency)</div>
@@ -584,6 +593,45 @@
             <div class="card">
                 <div class="card-title">Earning</div>
                 <div id="acct-earning" style="overflow-x:auto;"></div>
+            </div>
+
+            <!-- Exchange PnL & Delta card -->
+            <div class="card" style="margin-top:16px;">
+                <div class="card-title" style="display:flex; justify-content:space-between; align-items:center;">
+                    <span>Exchange P&amp;L &amp; Delta</span>
+                    <span style="font-size:11px; color:#8b949e; font-weight:400">balance − loan baseline</span>
+                </div>
+                <div id="exch-pnl-summary" style="margin-bottom:8px;"></div>
+                <div id="exch-pnl-ccy"></div>
+            </div>
+
+            <!-- Loan / Baseline settings card -->
+            <div class="card" style="margin-top:16px;">
+                <div class="card-title" style="display:flex; justify-content:space-between; align-items:center;">
+                    <span>Loan / Baseline</span>
+                    <span id="loan-meta" style="font-size:11px; color:#8b949e; font-weight:400"></span>
+                </div>
+                <div style="font-size:12px; color:#8b949e; margin-bottom:12px;">
+                    Enter the initial capital you deposited per currency. Exchange P&amp;L = current equity − this baseline.
+                </div>
+                <div style="display:flex; gap:8px; align-items:center; margin-bottom:10px; flex-wrap:wrap;">
+                    <select id="loan-gateway" class="depth-select" style="min-width:120px;"
+                            onchange="loadLoan(); loadExchangePnl();">
+                        <option value="okx">OKX</option>
+                        <option value="webull">Webull</option>
+                        <option value="futu">FUTU</option>
+                    </select>
+                    <button class="btn" style="background:#21262d; border:1px solid #30363d;"
+                            onclick="prefillLoanFromBalance()">↓ Prefill from current balance</button>
+                </div>
+                <div id="loan-entries" style="margin-bottom:10px;"></div>
+                <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+                    <button class="btn" onclick="addLoanRow()" style="background:#21262d; border:1px solid #30363d; font-size:12px;">+ Add row</button>
+                    <input id="loan-note" type="text" placeholder="Note (optional)"
+                           style="background:#0d1117; border:1px solid #30363d; color:#c9d1d9; padding:5px 8px; border-radius:4px; font-size:12px; flex:1; min-width:120px;">
+                    <button class="btn btn-buy" onclick="saveLoan()" style="font-size:12px; padding:6px 14px;">Save baseline</button>
+                </div>
+                <div id="loan-result" class="order-result" style="margin-top:8px;"></div>
             </div>
         </div>
     </div>
@@ -745,6 +793,7 @@
                 </div>
             </div>
             <input type="hidden" id="amend-gateway" />
+            <input type="hidden" id="amend-cl-ord-id" />
             <div style="display:flex; gap:8px; justify-content:flex-end;">
                 <button class="btn" onclick="closeAmendModal()">Cancel</button>
                 <button class="btn btn-primary" onclick="submitAmend()">Amend</button>
@@ -1001,13 +1050,303 @@
             }
         }
 
+        // ── P&L & Delta ──────────────────────────────────────────────────────
+        async function loadRiskPnl() {
+            try {
+                const resp = await fetch('/api/risk/pnl');
+                if (!resp.ok) return;
+                const data = await resp.json();
+                renderRiskPnl(data);
+            } catch (e) {}
+        }
+
+        function pnlColor(v) {
+            if (v > 0) return '#2dd4bf';
+            if (v < 0) return '#f87171';
+            return '#8b949e';
+        }
+
+        function renderRiskPnl(data) {
+            const agg = data.aggregate || {};
+            const realized   = agg.realized_pnl   || 0;
+            const unrealized = agg.unrealized_pnl || 0;
+            const total      = agg.total_pnl      || 0;
+            const fees       = agg.total_fees      || 0;
+
+            const fmt = v => (v >= 0 ? '+' : '') + v.toFixed(4);
+
+            // Summary row
+            document.getElementById('pnl-summary').innerHTML = `
+                <div style="display:flex; gap:24px; flex-wrap:wrap; font-size:13px;">
+                    <div>
+                        <div style="color:#8b949e; font-size:11px; margin-bottom:2px">Total P&L</div>
+                        <div style="font-weight:700; font-size:16px; color:${pnlColor(total)}">${fmt(total)}</div>
+                    </div>
+                    <div>
+                        <div style="color:#8b949e; font-size:11px; margin-bottom:2px">Realized</div>
+                        <div style="font-weight:600; color:${pnlColor(realized)}">${fmt(realized)}</div>
+                    </div>
+                    <div>
+                        <div style="color:#8b949e; font-size:11px; margin-bottom:2px">Unrealized</div>
+                        <div style="font-weight:600; color:${pnlColor(unrealized)}">${fmt(unrealized)}</div>
+                    </div>
+                    <div>
+                        <div style="color:#8b949e; font-size:11px; margin-bottom:2px">Fees paid</div>
+                        <div style="color:#f87171">${(-Math.abs(fees)).toFixed(4)}</div>
+                    </div>
+                </div>`;
+
+            // Per-symbol position rows
+            const positions = agg.positions || {};
+            const rows = Object.values(positions).filter(p => p.net_qty !== 0 || p.realized_pnl !== 0);
+
+            if (rows.length === 0) {
+                document.getElementById('pnl-positions').innerHTML =
+                    '<div style="color:#8b949e; font-size:12px; margin-top:8px">No positions tracked yet</div>';
+                return;
+            }
+
+            const header = `<div style="display:grid; grid-template-columns:1fr 90px 100px 90px 90px 90px 90px; gap:4px;
+                                font-size:11px; color:#8b949e; border-bottom:1px solid #30363d;
+                                padding-bottom:4px; margin-top:12px; margin-bottom:4px;">
+                <span>Symbol</span>
+                <span style="text-align:right">Net qty</span>
+                <span style="text-align:right">Avg entry</span>
+                <span style="text-align:right">Last</span>
+                <span style="text-align:right">Unrealized</span>
+                <span style="text-align:right">Realized</span>
+                <span style="text-align:right">$ Delta</span>
+            </div>`;
+
+            const rowHtml = rows.map(p => {
+                const side     = p.net_qty > 0 ? 'LONG' : 'SHORT';
+                const sideCol  = p.net_qty > 0 ? '#2dd4bf' : '#f87171';
+                const qtyStr   = (p.net_qty > 0 ? '+' : '') + p.net_qty.toFixed(6).replace(/\.?0+$/, '');
+                const entryStr = p.avg_entry_price > 0 ? p.avg_entry_price.toFixed(4) : '—';
+                const lastStr  = p.last_price   > 0 ? p.last_price.toFixed(4)    : '—';
+                const deltaStr = (p.dollar_delta >= 0 ? '+' : '') + p.dollar_delta.toFixed(2);
+                return `<div style="display:grid; grid-template-columns:1fr 90px 100px 90px 90px 90px 90px;
+                            gap:4px; font-size:12px; padding:5px 0; border-bottom:1px solid #21262d;">
+                    <span>
+                        <span style="color:${sideCol}; font-weight:600; font-size:10px; margin-right:4px">${side}</span>
+                        ${p.symbol}
+                        <span style="color:#6e7681; font-size:10px; margin-left:4px">${p.gateway}</span>
+                    </span>
+                    <span style="text-align:right; color:${sideCol}">${qtyStr}</span>
+                    <span style="text-align:right; color:#c9d1d9">${entryStr}</span>
+                    <span style="text-align:right; color:#c9d1d9">${lastStr}</span>
+                    <span style="text-align:right; color:${pnlColor(p.unrealized_pnl)}">${fmt(p.unrealized_pnl)}</span>
+                    <span style="text-align:right; color:${pnlColor(p.realized_pnl)}">${fmt(p.realized_pnl)}</span>
+                    <span style="text-align:right; color:${pnlColor(p.dollar_delta)}">${deltaStr}</span>
+                </div>`;
+            }).join('');
+
+            document.getElementById('pnl-positions').innerHTML = header + rowHtml;
+        }
+
+        // ── Exchange PnL ─────────────────────────────────────────────────────
+        async function loadExchangePnl() {
+            const gw = document.getElementById('loan-gateway')?.value || 'okx';
+            try {
+                const resp = await fetch(`/api/risk/exchange_pnl?gateway=${gw}`);
+                if (!resp.ok) return;
+                const d = await resp.json();
+                renderExchangePnl(d);
+            } catch (e) {}
+        }
+
+        function renderExchangePnl(d) {
+            const fmt  = (v, dp=4) => (v >= 0 ? '+' : '') + Number(v).toFixed(dp);
+            const fmtU = (v, dp=4) => Number(v).toFixed(dp);
+            const pc   = v => pnlColor(v);
+
+            // Summary strip
+            const hasLoan = d.has_loan;
+            const recon   = d.reconciliation ?? null;
+            const reconHtml = recon !== null
+                ? `<div>
+                    <div style="color:#8b949e; font-size:11px; margin-bottom:2px">Recon (trade−exch)</div>
+                    <div style="font-weight:600; color:${Math.abs(recon) < 1 ? '#8b949e' : '#f59e0b'}">${fmt(recon)}</div>
+                   </div>`
+                : '';
+            document.getElementById('exch-pnl-summary').innerHTML = `
+                <div style="display:flex; gap:24px; flex-wrap:wrap; font-size:13px;">
+                    <div>
+                        <div style="color:#8b949e; font-size:11px; margin-bottom:2px">Total Equity</div>
+                        <div style="font-weight:700; font-size:16px; color:#c9d1d9">${fmtU(d.total_eq_usd, 2)} USD</div>
+                    </div>
+                    <div>
+                        <div style="color:#8b949e; font-size:11px; margin-bottom:2px">Loan baseline</div>
+                        <div style="color:#8b949e">${hasLoan ? fmtU(d.loan_total_usd, 2) + ' USD' : '—  (not set)'}</div>
+                    </div>
+                    ${hasLoan ? `<div>
+                        <div style="color:#8b949e; font-size:11px; margin-bottom:2px">Exchange P&L</div>
+                        <div style="font-weight:700; font-size:16px; color:${pc(d.exchange_pnl)}">${fmt(d.exchange_pnl, 2)} USD</div>
+                    </div>` : ''}
+                    <div>
+                        <div style="color:#8b949e; font-size:11px; margin-bottom:2px">Net delta</div>
+                        <div style="color:#c9d1d9">${fmtU(d.exchange_delta, 2)} USD</div>
+                    </div>
+                    ${reconHtml}
+                </div>
+                ${d.loan_meta?.note ? `<div style="font-size:11px; color:#8b949e; margin-top:6px">📝 ${d.loan_meta.note}</div>` : ''}`;
+
+            // Per-CCY table
+            const rows = Object.values(d.per_ccy || {});
+            if (!rows.length) {
+                document.getElementById('exch-pnl-ccy').innerHTML = '';
+                return;
+            }
+            const header = `<div style="display:grid; grid-template-columns:60px 1fr 90px 1fr 1fr 1fr 90px 90px 1fr;
+                                gap:4px; font-size:11px; color:#8b949e;
+                                border-bottom:1px solid #30363d; padding:4px 0; margin-top:10px;">
+                <span>CCY</span>
+                <span style="text-align:right">Balance</span>
+                <span style="text-align:right">Px USD</span>
+                <span style="text-align:right">Equity USD</span>
+                <span style="text-align:right">Loan</span>
+                <span style="text-align:right">P&L USD</span>
+                <span style="text-align:right">Δ Cash</span>
+                <span style="text-align:right">Δ Deriv</span>
+                <span style="text-align:right">Δ Total</span>
+            </div>`;
+            const rowHtml = rows.map(c => {
+                const cashD  = c.cash_delta  ?? 0;
+                const derivD = c.deriv_delta ?? 0;
+                const totD   = c.delta_usd   ?? 0;
+                return `
+                <div style="display:grid; grid-template-columns:60px 1fr 90px 1fr 1fr 1fr 90px 90px 1fr;
+                            gap:4px; font-size:12px; padding:5px 0; border-bottom:1px solid #21262d;">
+                    <span style="font-weight:600; color:#58a6ff">${c.ccy}</span>
+                    <span style="text-align:right">${Number(c.cash_bal).toFixed(6)}</span>
+                    <span style="text-align:right; color:#8b949e">${c.price_usd > 0 ? fmtU(c.price_usd, 4) : '—'}</span>
+                    <span style="text-align:right">${fmtU(c.eq_usd, 4)}</span>
+                    <span style="text-align:right; color:#8b949e">${c.loan > 0 ? Number(c.loan).toFixed(4) : '—'}</span>
+                    <span style="text-align:right; color:${pc(c.pnl_usd)}">${hasLoan && c.loan > 0 ? fmt(c.pnl_usd, 4) : '—'}</span>
+                    <span style="text-align:right; color:${cashD !== 0 ? pc(cashD) : '#6e7681'}">${cashD !== 0 ? fmt(cashD, 2) : '—'}</span>
+                    <span style="text-align:right; color:${derivD !== 0 ? pc(derivD) : '#6e7681'}">${derivD !== 0 ? fmt(derivD, 2) : '—'}</span>
+                    <span style="text-align:right; font-weight:600; color:${pc(totD)}">${fmt(totD, 2)}</span>
+                </div>`;
+            }).join('');
+            document.getElementById('exch-pnl-ccy').innerHTML = header + rowHtml;
+        }
+
+        // ── Loan management ───────────────────────────────────────────────────
+        async function loadLoan() {
+            const gw = document.getElementById('loan-gateway')?.value || 'okx';
+            try {
+                const resp = await fetch(`/api/loan/${gw}`);
+                const d = await resp.json();
+                renderLoanEntries(d.entries || {});
+                const meta = d.meta || {};
+                const metaEl = document.getElementById('loan-meta');
+                if (meta.set_at_ms) {
+                    const dt = new Date(meta.set_at_ms).toLocaleString();
+                    metaEl.textContent = `Last set: ${dt}${meta.note ? ' · ' + meta.note : ''}`;
+                } else {
+                    metaEl.textContent = 'No baseline set yet';
+                }
+            } catch(e) {}
+        }
+
+        function renderLoanEntries(entries) {
+            const el = document.getElementById('loan-entries');
+            if (!Object.keys(entries).length) {
+                el.innerHTML = '<div style="color:#8b949e; font-size:12px">No entries. Click "Prefill from current balance" or add rows manually.</div>';
+                return;
+            }
+            el.innerHTML = Object.entries(entries).map(([ccy, amt]) =>
+                loanRowHtml(ccy, amt)
+            ).join('');
+        }
+
+        function loanRowHtml(ccy = '', amt = '') {
+            return `<div class="loan-row" style="display:flex; gap:6px; align-items:center; margin-bottom:6px;">
+                <input type="text" value="${ccy}" placeholder="CCY"
+                       style="width:80px; background:#0d1117; border:1px solid #30363d; color:#c9d1d9;
+                              padding:5px 8px; border-radius:4px; font-size:12px; text-transform:uppercase;">
+                <input type="number" value="${amt}" placeholder="Amount" step="any"
+                       style="width:140px; background:#0d1117; border:1px solid #30363d; color:#c9d1d9;
+                              padding:5px 8px; border-radius:4px; font-size:12px;">
+                <button onclick="this.closest('.loan-row').remove()"
+                        style="background:none; border:none; color:#f87171; cursor:pointer; font-size:14px; padding:2px 6px;">✕</button>
+            </div>`;
+        }
+
+        function addLoanRow() {
+            const el = document.getElementById('loan-entries');
+            // Clear placeholder text if present
+            if (el.querySelector('div:not(.loan-row)')) el.innerHTML = '';
+            el.insertAdjacentHTML('beforeend', loanRowHtml());
+        }
+
+        async function prefillLoanFromBalance() {
+            const gw = document.getElementById('loan-gateway')?.value || 'okx';
+            // Find account id for this gateway
+            try {
+                const accts = await (await fetch('/api/accounts')).json();
+                const acct  = accts.find(a => (a.gateway || '').toLowerCase() === gw);
+                if (!acct) { alert('No account data found for ' + gw); return; }
+                const data  = await (await fetch(`/api/account/${acct.acct_id}`)).json();
+                const details = data.trading?.details || [];
+                if (!details.length) { alert('No balance data available yet'); return; }
+                const el = document.getElementById('loan-entries');
+                el.innerHTML = details
+                    .filter(d => parseFloat(d.cashBal || 0) > 0)
+                    .map(d => loanRowHtml(d.ccy, parseFloat(d.cashBal).toFixed(8)))
+                    .join('');
+            } catch(e) { alert('Error: ' + e.message); }
+        }
+
+        async function saveLoan() {
+            const gw      = document.getElementById('loan-gateway')?.value || 'okx';
+            const note    = document.getElementById('loan-note')?.value || '';
+            const rows    = document.querySelectorAll('.loan-row');
+            const entries = [];
+            rows.forEach(row => {
+                const inputs = row.querySelectorAll('input');
+                const ccy    = inputs[0].value.trim().toUpperCase();
+                const amount = parseFloat(inputs[1].value);
+                if (ccy && !isNaN(amount)) entries.push({ ccy, amount });
+            });
+            if (!entries.length) {
+                document.getElementById('loan-result').className = 'order-result error';
+                document.getElementById('loan-result').textContent = 'No valid entries to save';
+                return;
+            }
+            const resp = await fetch(`/api/loan/${gw}`, {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ entries, note }),
+            });
+            const data = await resp.json();
+            const el   = document.getElementById('loan-result');
+            if (resp.ok) {
+                el.className = 'order-result success';
+                el.textContent = `Baseline saved for ${gw}: ${Object.entries(data.entries).map(([c,v]) => `${v} ${c}`).join(', ')}`;
+                loadLoan();
+                loadExchangePnl();
+            } else {
+                el.className = 'order-result error';
+                el.textContent = data.detail || 'Save failed';
+            }
+            setTimeout(() => { el.className = 'order-result'; }, 5000);
+        }
+
         // ── Account ──────────────────────────────────────────────────────────
         let acctRefreshTimer = null;
         async function startAcctRefresh() {
             stopAcctRefresh();
             await loadAccountsList();
             await loadAccountInfo();
-            acctRefreshTimer = setInterval(loadAccountInfo, 3000);
+            await loadRiskPnl();
+            await loadLoan();
+            await loadExchangePnl();
+            acctRefreshTimer = setInterval(() => {
+                loadAccountInfo();
+                loadRiskPnl();
+                loadExchangePnl();
+            }, 3000);
         }
         function stopAcctRefresh() {
             if (acctRefreshTimer) { clearInterval(acctRefreshTimer); acctRefreshTimer = null; }
@@ -1481,13 +1820,17 @@
                 });
                 const data = await resp.json();
                 if (resp.ok) {
-                    resultEl.className = 'order-result success';
+                    resultEl.className = data.status === 'pending'
+                        ? 'order-result warning'
+                        : 'order-result success';
                     resultEl.textContent = data.message;
                     loadOrderHistory();
                     setTimeout(loadPendingOrders, 2000);
                 } else {
+                    // 422 = rejected by risk engine; data.message has the reason
                     resultEl.className = 'order-result error';
-                    resultEl.textContent = data.detail || 'Order failed';
+                    resultEl.textContent = data.message || data.detail || 'Order failed';
+                    loadOrderHistory();   // show the REJECTED entry in history
                 }
             } catch (e) {
                 resultEl.className = 'order-result error';
@@ -1506,24 +1849,42 @@
                     return;
                 }
                 el.innerHTML = orders.slice().reverse().map(o => {
-                    const ts = o.timestamp ? new Date(parseInt(o.timestamp)).toLocaleTimeString() : '';
+                    const ts = o.update_time_ms
+                        ? new Date(parseInt(o.update_time_ms)).toLocaleTimeString()
+                        : (o.timestamp ? new Date(parseFloat(o.timestamp) * 1000).toLocaleTimeString() : '');
                     const sideClass = o.side === 'buy' ? 'signal-buy' : 'signal-sell';
                     const state = o.state || '';
                     const stateColor = state === 'filled' ? '#2dd4bf' : state === 'rejected' ? '#f59e0b' : '#f87171';
-                    const price = parseFloat(o.avg_price || o.price || 0);
-                    const priceStr = price > 0 ? price.toFixed(2) : '—';
-                    const qty = o.quantity || o.sz || '0';
+                    // Use parseFloat on each field individually — JS "0" is truthy
+                    // so || chaining skips it wrongly. Show avg fill price when
+                    // available, fall back to limit price for unfilled orders.
+                    const avgPrice = parseFloat(o.avg_fill_price) || parseFloat(o.avg_price) || parseFloat(o.price) || 0;
+                    const priceStr = avgPrice > 0 ? avgPrice.toFixed(2) : '—';
+                    const qty = o.quantity || '0';
                     const filledQty = o.filled_qty || '0';
+                    // Show clOrdId when present, fall back to last-8 of ordId
+                    const clId = o.client_order_id || '';
+                    const ordId = o.order_id || '';
+                    const idLine = clId
+                        ? `clOrd: <span style="color:#58a6ff">${clId}</span>`
+                          + (ordId ? ` &nbsp;exch: <span style="color:#6e7681">${ordId.slice(-8)}</span>` : '')
+                        : (ordId ? `id: <span style="color:#6e7681">${ordId.slice(-8)}</span>` : '');
+                    const rejectLine = state === 'rejected' && o.reject_reason
+                        ? `<div style="font-size:11px; color:#f87171; margin-top:2px">⛔ ${o.reject_reason}</div>`
+                        : '';
                     return `<div class="order-history-row">
                         <div>
                             <div>
                                 <span style="color:${stateColor}; font-weight:600">${state.toUpperCase()}</span>
                                 <span class="${sideClass}" style="margin-left:8px; font-weight:600">${(o.side || '').toUpperCase()}</span>
-                                <span style="margin-left:8px">${o.symbol}</span>
+                                <span style="margin-left:8px">${o.symbol || ''}</span>
                             </div>
                             <div style="font-size:11px; color:#8b949e; margin-top:2px">
-                                ${ts} | qty: ${filledQty}/${qty} @ ${priceStr}${o.order_id ? ` | id: ${o.order_id.slice(-8)}` : ''}
-                            </div>${o.comment ? `<div style="font-size:11px; color:#f59e0b; margin-top:2px">${o.comment}</div>` : ''}
+                                ${ts} | qty: ${filledQty}/${qty} @ ${priceStr}
+                                ${idLine ? ` | ${idLine}` : ''}
+                            </div>
+                            ${rejectLine}
+                            ${o.comment ? `<div style="font-size:11px; color:#f59e0b; margin-top:2px">${o.comment}</div>` : ''}
                         </div>
                     </div>`;
                 }).join('');
@@ -1545,20 +1906,29 @@
                     const sideClass = o.side === 'buy' ? 'signal-buy' : 'signal-sell';
                     const price = parseFloat(o.price || 0);
                     const qty = parseFloat(o.quantity || o.sz || 0);
-                    const shortId = (o.order_id || '').slice(-8);
+                    const filledQty = parseFloat(o.filled_qty || 0);
+                    const clId  = o.client_order_id || '';
+                    const ordId = o.order_id || '';
+                    // Escape for onclick attribute (single-quote safe)
+                    const clIdEsc  = clId.replace(/'/g, "\\'");
+                    const ordIdEsc = ordId.replace(/'/g, "\\'");
+                    const idLine = clId
+                        ? `clOrd: <span style="color:#58a6ff">${clId}</span>`
+                          + (ordId ? ` &nbsp;exch: <span style="color:#6e7681">${ordId.slice(-8)}</span>` : '')
+                        : `ID: <span style="color:#6e7681">${ordId || '?'}</span>`;
                     return `<div class="pending-row">
                         <div>
                             <div>
                                 <span class="${sideClass}" style="font-weight:600">${(o.side || '').toUpperCase()}</span>
-                                <span style="margin-left:6px">${o.symbol}</span>
-                                <span style="margin-left:6px; color:#8b949e">${qty} @ ${price.toFixed(2)}</span>
-                                <span style="margin-left:6px; color:#8b949e">[${o.state || 'live'}]</span>
+                                <span style="margin-left:6px">${o.symbol || ''}</span>
+                                <span style="margin-left:6px; color:#8b949e">${filledQty}/${qty} @ ${price > 0 ? price.toFixed(2) : '—'}</span>
+                                <span style="margin-left:6px; color:#8b949e">[${o.state || 'open'}]</span>
                             </div>
-                            <div style="font-size:11px; color:#8b949e; margin-top:2px;">ID: ${o.order_id || '?'}</div>
+                            <div style="font-size:11px; color:#8b949e; margin-top:2px;">${idLine}</div>
                         </div>
                         <span>
-                            <button class="btn btn-xs btn-warn" onclick="openAmendModal('${gw}','${o.order_id}','${o.symbol}',${price},${qty})">Amend</button>
-                            <button class="btn btn-xs btn-danger" onclick="cancelOrder('${gw}','${o.order_id}','${o.symbol}')">Cancel</button>
+                            <button class="btn btn-xs btn-warn" onclick="openAmendModal('${gw}','${ordIdEsc}','${o.symbol}',${price},${qty},'${clIdEsc}')">Amend</button>
+                            <button class="btn btn-xs btn-danger" onclick="cancelOrder('${gw}','${ordIdEsc}','${o.symbol}','${clIdEsc}')">Cancel</button>
                         </span>
                     </div>`;
                 }).join('');
@@ -1568,13 +1938,19 @@
             }
         }
 
-        async function cancelOrder(gateway, orderId, symbol) {
-            if (!confirm(`Cancel order ${orderId}?`)) return;
+        async function cancelOrder(gateway, orderId, symbol, clOrdId = '') {
+            const label = clOrdId || orderId;
+            if (!confirm(`Cancel order ${label}?`)) return;
             try {
                 const resp = await fetch('/api/order/cancel', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ gateway, order_id: orderId, symbol }),
+                    body: JSON.stringify({
+                        gateway,
+                        order_id: orderId,
+                        symbol,
+                        client_order_id: clOrdId,
+                    }),
                 });
                 const data = await resp.json();
                 const resultEl = document.getElementById('order-result');
@@ -1586,8 +1962,9 @@
             } catch (e) {}
         }
 
-        function openAmendModal(gateway, orderId, symbol, price, qty) {
+        function openAmendModal(gateway, orderId, symbol, price, qty, clOrdId = '') {
             document.getElementById('amend-gateway').value = gateway;
+            document.getElementById('amend-cl-ord-id').value = clOrdId;
             document.getElementById('amend-order-id').textContent = orderId;
             document.getElementById('amend-symbol').textContent = symbol;
             document.getElementById('amend-price').value = price;
@@ -1601,10 +1978,11 @@
         }
 
         async function submitAmend() {
-            const gateway = document.getElementById('amend-gateway').value;
-            const orderId = document.getElementById('amend-order-id').textContent;
-            const symbol = document.getElementById('amend-symbol').textContent;
-            const price = parseFloat(document.getElementById('amend-price').value) || 0;
+            const gateway  = document.getElementById('amend-gateway').value;
+            const clOrdId  = document.getElementById('amend-cl-ord-id').value;
+            const orderId  = document.getElementById('amend-order-id').textContent;
+            const symbol   = document.getElementById('amend-symbol').textContent;
+            const price    = parseFloat(document.getElementById('amend-price').value) || 0;
             const quantity = parseFloat(document.getElementById('amend-quantity').value) || 0;
             const resultEl = document.getElementById('amend-result');
 
@@ -1612,7 +1990,14 @@
                 const resp = await fetch('/api/order/amend', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ gateway, order_id: orderId, symbol, price, quantity }),
+                    body: JSON.stringify({
+                        gateway,
+                        order_id: orderId,
+                        client_order_id: clOrdId,
+                        symbol,
+                        price,
+                        quantity,
+                    }),
                 });
                 const data = await resp.json();
                 resultEl.className = resp.ok ? 'order-result success' : 'order-result error';

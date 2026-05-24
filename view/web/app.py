@@ -769,6 +769,306 @@ async def get_pnl(strategy: str, count: int = 100):
     return [{"id": h[0], **h[1]} for h in history]
 
 
+@app.get("/api/risk/pnl")
+async def get_risk_pnl():
+    """
+    Return live PnL and delta snapshots written by the risk engine.
+
+    Response shape
+    ──────────────
+    strategies   Per-strategy snapshots keyed by strategy name.
+    aggregate    Sum of all strategies: total PnL + positions merged by symbol.
+    delta_by_symbol  Only symbols with an open position; quick view for the UI.
+    """
+    r = await get_redis()
+    keys = await r.keys("pnl:*")
+
+    strategies: dict = {}
+    for key in keys:
+        raw = await r.get(key)
+        if not raw:
+            continue
+        try:
+            data     = json.loads(raw)
+            name     = data.get("strategy") or (
+                key.decode() if isinstance(key, bytes) else key
+            ).replace("pnl:", "")
+            strategies[name] = data
+        except Exception:
+            pass
+
+    # Build aggregate across all strategies
+    agg_positions: dict = {}
+    total_realized   = 0.0
+    total_unrealized = 0.0
+    total_fees       = 0.0
+
+    for s_data in strategies.values():
+        total_realized   += s_data.get("realized_pnl", 0)
+        total_unrealized += s_data.get("unrealized_pnl", 0)
+        total_fees       += s_data.get("total_fees", 0)
+        for pk, pos in s_data.get("positions", {}).items():
+            if pk not in agg_positions:
+                agg_positions[pk] = {
+                    "symbol":       pos["symbol"],
+                    "gateway":      pos["gateway"],
+                    "net_qty":      0.0,
+                    "avg_entry_price": pos.get("avg_entry_price", 0),
+                    "realized_pnl": 0.0,
+                    "unrealized_pnl": 0.0,
+                    "total_fees":   0.0,
+                    "dollar_delta": 0.0,
+                    "last_price":   pos.get("last_price", 0),
+                }
+            ap = agg_positions[pk]
+            ap["net_qty"]        += pos.get("net_qty", 0)
+            ap["realized_pnl"]   += pos.get("realized_pnl", 0)
+            ap["unrealized_pnl"] += pos.get("unrealized_pnl", 0)
+            ap["total_fees"]     += pos.get("total_fees", 0)
+            ap["dollar_delta"]    = ap["net_qty"] * pos.get("last_price", 0)
+            ap["last_price"]      = pos.get("last_price", ap["last_price"])
+
+    # Flatten to per-symbol delta summary (open positions only)
+    delta_by_symbol = {
+        ap["symbol"]: {
+            "gateway":     ap["gateway"],
+            "net_qty":     round(ap["net_qty"], 8),
+            "dollar_delta": round(ap["dollar_delta"], 2),
+            "last_price":  ap["last_price"],
+        }
+        for ap in agg_positions.values()
+        if ap["net_qty"] != 0
+    }
+
+    return {
+        "strategies": strategies,
+        "aggregate": {
+            "realized_pnl":   round(total_realized, 8),
+            "unrealized_pnl": round(total_unrealized, 8),
+            "total_pnl":      round(total_realized + total_unrealized, 8),
+            "total_fees":     round(total_fees, 8),
+            "positions":      agg_positions,
+        },
+        "delta_by_symbol": delta_by_symbol,
+    }
+
+
+# ── Loan / Baseline management ────────────────────────────────────────────────
+
+_STABLES = frozenset({"USDT", "USDC", "BUSD", "DAI", "TUSD", "USDP", "FDUSD", "USD"})
+
+
+class LoanEntry(BaseModel):
+    ccy: str
+    amount: float
+
+
+class LoanRequest(BaseModel):
+    entries: list[LoanEntry]
+    note: str = ""
+
+
+@app.get("/api/loan/{gateway}")
+async def get_loan(gateway: str):
+    """Return the saved loan (baseline) snapshot for a gateway."""
+    r = await get_redis()
+    raw  = await r.get(f"loan:{gateway}")
+    meta = await r.get(f"loan:{gateway}:meta")
+    return {
+        "gateway":  gateway,
+        "entries":  json.loads(raw)  if raw  else {},
+        "meta":     json.loads(meta) if meta else {},
+    }
+
+
+@app.post("/api/loan/{gateway}")
+async def set_loan(gateway: str, req: LoanRequest):
+    """Save a loan (baseline) snapshot for a gateway."""
+    r = await get_redis()
+    entries = {e.ccy.upper(): e.amount for e in req.entries if e.amount != 0}
+    meta    = {"set_at_ms": int(time.time() * 1000), "note": req.note}
+    await r.set(f"loan:{gateway}", json.dumps(entries))
+    await r.set(f"loan:{gateway}:meta", json.dumps(meta))
+    return {"status": "ok", "gateway": gateway, "entries": entries}
+
+
+async def _get_px(ccy: str, r) -> float:
+    """Look up a currency's USD price from the risk engine's price cache."""
+    ccy = ccy.upper()
+    if ccy in _STABLES:
+        return 1.0
+    raw = await r.get(f"px:{ccy}")
+    return float(raw) if raw else 0.0
+
+
+@app.get("/api/risk/exchange_pnl")
+async def get_exchange_pnl(gateway: str = "okx"):
+    """
+    Exchange-based PnL and delta.
+
+    Formula per currency C
+    ──────────────────────
+      cash_pnl_C   = (cashBal_C  − loan_C) × price_C_USD
+      settle_upnl_C = upl_C  (unrealized PnL for instruments settling in C)
+      pnl_C        = cash_pnl_C + settle_upnl_C
+
+    total_exchange_pnl = Σ_C pnl_C
+
+    Delta per currency C
+    ─────────────────────
+      delta_C = (cashBal_C + Σ open_instrument_qty_in_C) × price_C_USD
+              ≈ eqUsd_C   (OKX already computes equity × price = eqUsd)
+
+    Reconciliation
+    ──────────────
+      trade_pnl   from risk engine fill tracking
+      exchange_pnl from this calculation
+      diff        = trade_pnl − exchange_pnl  (should be near 0)
+
+    Notes
+    ─────
+    - For OKX: eqUsd per currency = (cashBal + settled derivatives) × OKX spot price.
+      We use eqUsd_C / cashBal_C as the implied price, avoiding a separate price feed.
+    - For Webull/FUTU: balances are already in USD; price = 1.0 per USD unit.
+    - Prices for the loan valuation come from the risk engine's px:{ccy} cache
+      (populated from live tick data).  Missing prices show as 0 — fill them in
+      via the loan page or wait for ticks to arrive.
+    """
+    r = await get_redis()
+
+    # ── Load loan baseline ────────────────────────────────────────────────
+    loan_raw  = await r.get(f"loan:{gateway}")
+    loan_meta = await r.get(f"loan:{gateway}:meta")
+    loan: dict[str, float] = json.loads(loan_raw)  if loan_raw  else {}
+    meta: dict             = json.loads(loan_meta) if loan_meta else {}
+
+    # ── Fetch trading account from Redis (written by gateway) ─────────────
+    acct_keys = await r.hgetall("accounts")
+    acct_id   = None
+    for aid, raw_v in acct_keys.items():
+        info = json.loads(raw_v)
+        if info.get("gateway", "").lower() == gateway.lower():
+            acct_id = aid.decode() if isinstance(aid, bytes) else aid
+            break
+
+    if not acct_id:
+        return {"error": f"No account found for gateway '{gateway}'", "loan": loan}
+
+    trading_raw = await r.get(f"account:{acct_id}:trading")
+    trading     = json.loads(trading_raw) if trading_raw else {}
+    summary     = trading.get("summary", {})
+    details     = trading.get("details", [])    # list of per-ccy dicts
+
+    total_eq_usd = float(summary.get("totalEq", 0) or 0)
+
+    # ── Derivative positions (for delta calculation) ──────────────────────
+    # Each position contributes directional delta to its base currency.
+    # Example: BTC-USDT-SWAP pos=0.01 notionalUsd=7.67 → +7.67 to BTC delta
+    #          short pos=-0.5 → negative delta
+    positions_raw = await r.get(f"account:{acct_id}:positions")
+    positions     = json.loads(positions_raw) if positions_raw else []
+
+    # Aggregate derivative notional per base currency
+    deriv_delta: dict[str, float] = {}   # ccy → signed USD notional
+    for pos in positions:
+        inst_id = pos.get("instId", "")
+        base    = inst_id.split("-")[0].upper() if "-" in inst_id else ""
+        if not base:
+            continue
+        pos_qty   = float(pos.get("pos", 0) or 0)
+        notional  = float(pos.get("notionalUsd", 0) or 0)
+        signed_n  = notional if pos_qty >= 0 else -notional
+        deriv_delta[base] = deriv_delta.get(base, 0.0) + signed_n
+
+    # ── Per-currency calculation ──────────────────────────────────────────
+    per_ccy: dict = {}
+    loan_total_usd     = 0.0
+    exchange_delta_usd = 0.0
+
+    for d in details:
+        ccy       = d.get("ccy", "").upper()
+        cash_bal  = float(d.get("cashBal", 0) or 0)
+        eq        = float(d.get("eq",      cash_bal) or cash_bal)
+        eq_usd    = float(d.get("eqUsd",   0) or 0)
+        upl       = float(d.get("upl",     0) or 0)
+
+        # Implied price from OKX's own conversion (most accurate for OKX)
+        implied_px = (eq_usd / eq) if eq != 0 else await _get_px(ccy, r)
+        if implied_px == 0:
+            implied_px = await _get_px(ccy, r)
+
+        loan_ccy     = loan.get(ccy, 0.0)
+        loan_usd_val = loan_ccy * implied_px
+        pnl_usd      = eq_usd - loan_usd_val
+
+        loan_total_usd += loan_usd_val
+
+        # Delta: stablecoins have zero market delta (no directional exposure).
+        # Non-stable cash delta = eqUsd (you're long that crypto).
+        # Derivative delta from positions is added on top.
+        is_stable   = ccy in _STABLES
+        cash_delta  = 0.0 if is_stable else eq_usd
+        deriv_d     = deriv_delta.pop(ccy, 0.0)
+        total_delta = cash_delta + deriv_d
+
+        exchange_delta_usd += total_delta
+
+        per_ccy[ccy] = {
+            "ccy":          ccy,
+            "cash_bal":     cash_bal,
+            "eq":           eq,
+            "eq_usd":       round(eq_usd, 4),
+            "upl":          round(upl, 4),
+            "price_usd":    round(implied_px, 6),
+            "loan":         loan_ccy,
+            "loan_usd":     round(loan_usd_val, 4),
+            "pnl_usd":      round(pnl_usd, 4),
+            "cash_delta":   round(cash_delta, 4),
+            "deriv_delta":  round(deriv_d, 4),
+            "delta_usd":    round(total_delta, 4),
+        }
+
+    # Derivative delta for currencies with no cash balance (shouldn't happen
+    # normally, but included for completeness)
+    for ccy, dd in deriv_delta.items():
+        px = await _get_px(ccy, r)
+        per_ccy[ccy] = {
+            "ccy": ccy, "cash_bal": 0, "eq": 0, "eq_usd": 0, "upl": 0,
+            "price_usd": round(px, 6), "loan": loan.get(ccy, 0),
+            "loan_usd": round(loan.get(ccy, 0) * px, 4),
+            "pnl_usd": round(-loan.get(ccy, 0) * px, 4),
+            "cash_delta": 0, "deriv_delta": round(dd, 4),
+            "delta_usd": round(dd, 4),
+        }
+        exchange_delta_usd += dd
+
+    exchange_pnl = total_eq_usd - loan_total_usd
+
+    # ── Reconciliation with trade-based PnL ──────────────────────────────
+    trade_pnl = 0.0
+    pnl_keys  = await r.keys("pnl:*")
+    for pk in pnl_keys:
+        pnl_raw = await r.get(pk)
+        if pnl_raw:
+            try:
+                trade_pnl += json.loads(pnl_raw).get("total_pnl", 0)
+            except Exception:
+                pass
+
+    return {
+        "gateway":          gateway,
+        "total_eq_usd":     round(total_eq_usd, 4),
+        "loan_total_usd":   round(loan_total_usd, 4),
+        "exchange_pnl":     round(exchange_pnl, 4),
+        "exchange_delta":   round(exchange_delta_usd, 4),
+        "trade_pnl":        round(trade_pnl, 8),
+        "reconciliation":   round(trade_pnl - exchange_pnl, 4),
+        "per_ccy":          per_ccy,
+        "loan_meta":        meta,
+        "has_loan":         bool(loan),
+    }
+
+
 @app.post("/api/strategy/{name}/params")
 async def update_params(name: str, params: dict):
     r = await get_redis()
@@ -810,12 +1110,14 @@ class CancelOrderRequest(BaseModel):
     gateway: str
     symbol: str
     order_id: str
+    client_order_id: str = ""   # preferred over order_id on exchanges that support it
 
 
 class AmendOrderRequest(BaseModel):
     gateway: str
     symbol: str
     order_id: str
+    client_order_id: str = ""
     price: float = 0.0
     quantity: float = 0.0
 
@@ -832,6 +1134,9 @@ def _get_signal_pusher() -> Pusher:
 
 @app.post("/api/order")
 async def place_manual_order(req: ManualOrderRequest):
+    # request_id links the signal to its response and doubles as client_order_id
+    # for rejected orders written to finished_orders by the risk engine.
+    request_id = secrets.token_hex(8)
     signal = {
         "event_type": "signal",
         "strategy": "_manual_",
@@ -843,21 +1148,49 @@ async def place_manual_order(req: ManualOrderRequest):
         "quantity": req.quantity,
         "reason": "manual order via dashboard",
         "timestamp": time.time(),
+        "request_id": request_id,
     }
     pusher = _get_signal_pusher()
     await pusher.push(signal)
+
+    # Wait up to 500 ms for the risk engine to write its verdict.
+    # 10 × 50 ms is well within a single ZMQ round-trip on localhost.
     r = await get_redis()
+    response_key = f"order_response:{request_id}"
+    result = None
+    for _ in range(10):
+        await asyncio.sleep(0.05)
+        raw = await r.get(response_key)
+        if raw:
+            result = json.loads(raw)
+            await r.delete(response_key)
+            break
+
+    if result is None:
+        # Risk engine didn't respond in time — treat as pending (rare).
+        logger.warning("Risk engine did not respond to request_id %s within 500ms", request_id)
+        await r.xadd("manual_orders", {
+            "gateway": req.gateway, "symbol": req.symbol, "side": req.side,
+            "order_type": req.order_type, "price": str(req.price),
+            "quantity": str(req.quantity), "timestamp": str(time.time()),
+            "action": "new", "status": "pending",
+        }, maxlen=500)
+        return {"status": "pending", "message": f"{req.side} {req.quantity} {req.symbol} sent (unconfirmed — risk engine timeout)"}
+
+    if not result["approved"]:
+        reason = result.get("reason", "Rejected by risk engine")
+        return JSONResponse(
+            status_code=422,
+            content={"status": "rejected", "message": reason},
+        )
+
     await r.xadd("manual_orders", {
-        "gateway": req.gateway,
-        "symbol": req.symbol,
-        "side": req.side,
-        "order_type": req.order_type,
-        "price": str(req.price),
-        "quantity": str(req.quantity),
-        "timestamp": str(time.time()),
-        "action": "new",
+        "gateway": req.gateway, "symbol": req.symbol, "side": req.side,
+        "order_type": req.order_type, "price": str(req.price),
+        "quantity": str(req.quantity), "timestamp": str(time.time()),
+        "action": "new", "status": "approved",
     }, maxlen=500)
-    return {"status": "ok", "message": f"{req.side} {req.quantity} {req.symbol} sent to risk engine"}
+    return {"status": "ok", "message": f"{req.side} {req.quantity} {req.symbol} order placed"}
 
 
 @app.post("/api/order/cancel")
@@ -867,6 +1200,7 @@ async def cancel_order(req: CancelOrderRequest):
         "gateway": req.gateway,
         "symbol": req.symbol,
         "order_id": req.order_id,
+        "client_order_id": req.client_order_id,
         "timestamp": time.time(),
     }
     pusher = _get_signal_pusher()
@@ -876,10 +1210,12 @@ async def cancel_order(req: CancelOrderRequest):
         "gateway": req.gateway,
         "symbol": req.symbol,
         "order_id": req.order_id,
+        "client_order_id": req.client_order_id,
         "timestamp": str(time.time()),
         "action": "cancel",
     }, maxlen=500)
-    return {"status": "ok", "message": f"Cancel {req.order_id} sent to {req.gateway}"}
+    label = req.client_order_id or req.order_id
+    return {"status": "ok", "message": f"Cancel {label} sent to {req.gateway}"}
 
 
 @app.post("/api/order/amend")
@@ -889,6 +1225,7 @@ async def amend_order(req: AmendOrderRequest):
         "gateway": req.gateway,
         "symbol": req.symbol,
         "order_id": req.order_id,
+        "client_order_id": req.client_order_id,
         "price": req.price,
         "quantity": req.quantity,
         "timestamp": time.time(),
@@ -900,19 +1237,91 @@ async def amend_order(req: AmendOrderRequest):
         "gateway": req.gateway,
         "symbol": req.symbol,
         "order_id": req.order_id,
+        "client_order_id": req.client_order_id,
         "price": str(req.price),
         "quantity": str(req.quantity),
         "timestamp": str(time.time()),
         "action": "amend",
     }, maxlen=500)
-    return {"status": "ok", "message": f"Amend {req.order_id} sent to {req.gateway}"}
+    label = req.client_order_id or req.order_id
+    return {"status": "ok", "message": f"Amend {label} sent to {req.gateway}"}
+
+
+@app.get("/api/order/updates")
+async def get_order_updates(count: int = 200, gateway: str = "okx"):
+    """Full audit log — every state change (pending_submit→open→partial→filled/cancelled)."""
+    r = await get_redis()
+    entries = await r.xrange(f"order_updates:{gateway}", "-", "+", count=count)
+    return [{"_stream_id": e[0], **e[1]} for e in entries]
 
 
 @app.get("/api/order/history")
-async def get_order_history(count: int = 50):
+async def get_order_history(count: int = 50, gateway: str = "okx"):
+    """Terminal orders, one entry per order (deduped by client_order_id / order_id).
+
+    finished_orders may contain duplicate entries for the same order if a REST
+    sync and a WS push both arrived before the SET-NX lock was in place.
+    We deduplicate here at read time, keeping the entry with the latest
+    update_time_ms so the UI always shows the most complete snapshot.
+    """
     r = await get_redis()
-    orders = await r.xrange("finished_orders", "-", "+", count=count)
-    return [{"id": o[0], **o[1]} for o in orders]
+    # Fetch more than `count` so dedup doesn't shrink the result below what the
+    # caller asked for (fetch 4× then trim to count after dedup).
+    raw = await r.xrange("finished_orders", "-", "+", count=count * 4)
+
+    # Deduplicate: key = client_order_id if set, else order_id.
+    # Stream entries arrive oldest-first; iterating forward means later entries
+    # (higher update_time_ms) naturally overwrite earlier ones in the dict.
+    seen: dict[str, dict] = {}
+    for stream_id, fields in raw:
+        entry = {"_stream_id": stream_id, **fields}
+        # order_id (exchange-assigned) is the canonical dedup key.
+        # client_order_id is only a fallback for rejected orders that never
+        # received an exchange ID.  Old entries written before client_order_id
+        # was added to the schema will only have order_id, so checking
+        # order_id first ensures they still deduplicate correctly.
+        key = fields.get("order_id") or fields.get("client_order_id") or stream_id
+        existing = seen.get(key)
+        if existing is None:
+            seen[key] = entry
+        else:
+            # Keep whichever has the later update_time_ms (more recent state).
+            # Fall back to stream_id comparison (later stream_id = later write)
+            # for old entries that predate the update_time_ms field.
+            new_ts = int(fields.get("update_time_ms") or 0)
+            old_ts = int(existing.get("update_time_ms") or 0)
+            if new_ts > old_ts or (new_ts == old_ts and stream_id > existing["_stream_id"]):
+                seen[key] = entry
+
+    # Return newest-first, capped at count
+    deduped = list(seen.values())
+    deduped.sort(key=lambda e: int(e.get("update_time_ms", 0) or 0), reverse=True)
+    return deduped[:count]
+
+
+@app.get("/api/order/fills")
+async def get_order_fills(count: int = 200, gateway: str = "okx"):
+    """Individual fill executions, one entry per fill_id (deduped).
+
+    Deduplicates by fill_id for the same reason as /api/order/history.
+    """
+    r = await get_redis()
+    raw = await r.xrange(f"fills:{gateway}", "-", "+", count=count * 4)
+
+    seen: dict[str, dict] = {}
+    for stream_id, fields in raw:
+        entry = {"_stream_id": stream_id, **fields}
+        key = fields.get("fill_id") or stream_id
+        existing = seen.get(key)
+        if existing is None:
+            seen[key] = entry
+        else:
+            if int(fields.get("fill_time_ms", 0)) >= int(existing.get("fill_time_ms", 0)):
+                seen[key] = entry
+
+    deduped = list(seen.values())
+    deduped.sort(key=lambda e: int(e.get("fill_time_ms", 0) or 0), reverse=True)
+    return deduped[:count]
 
 
 @app.get("/api/order/pending")

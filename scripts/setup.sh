@@ -10,6 +10,7 @@
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+VENV_DIR="$REPO_DIR/.venv"
 PYTHON="${PYTHON:-python3}"
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -79,6 +80,19 @@ start_redis() {
             exit 1
         fi
     fi
+}
+
+# ── Create / reuse virtualenv ──────────────────────────────
+create_venv() {
+    if [ -f "$VENV_DIR/bin/python" ]; then
+        info "Virtualenv already exists at .venv/"
+    else
+        info "Creating virtualenv at .venv/ ..."
+        "$PYTHON" -m venv "$VENV_DIR"
+        info "Virtualenv created."
+    fi
+    # From here on, use the venv's python/pip
+    PYTHON="$VENV_DIR/bin/python"
 }
 
 # ── Install Python dependencies ────────────────────────────
@@ -169,6 +183,13 @@ check_only() {
         warn ".env file not found."
     fi
 
+    if [ -f "$VENV_DIR/bin/python" ]; then
+        info "Virtualenv present at .venv/"
+        PYTHON="$VENV_DIR/bin/python"
+    else
+        warn "Virtualenv not found — run setup.sh to create it."
+    fi
+
     echo ""
     echo "=== Process Status ==="
     cd "$REPO_DIR"
@@ -191,6 +212,7 @@ main() {
     check_python
     install_redis
     start_redis
+    create_venv
     install_python_deps
     verify_imports
     create_env_template
@@ -204,9 +226,12 @@ main() {
     echo ""
     echo "Next steps:"
     echo "  1. Edit .env with your OKX demo API keys"
-    echo "  2. Source env:     source .env && export \$(grep -v '^#' .env | xargs)"
-    echo "  3. Start system:  python3 supervisor.py start all"
-    echo "  4. Check status:  python3 supervisor.py status"
+    echo "  2. Activate venv:  source .venv/bin/activate"
+    echo "  3. Source env:     set -a && source .env && set +a"
+    echo "  4. Start system:   python supervisor.py start all   # 'python' = Python 3 inside venv"
+    echo "  5. Check status:   python supervisor.py status"
+    echo ""
+    echo "  Or without activating: .venv/bin/python supervisor.py start all"
     echo ""
 }
 
