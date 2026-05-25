@@ -43,7 +43,6 @@ class TelegramReporter(ProcessBase):
         await asyncio.gather(
             self._listen_fills(fill_sub),
             self._listen_kills(kill_sub),
-            self._periodic_summary(),
             self._poll_commands(),
         )
 
